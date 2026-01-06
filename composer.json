@@ -1,0 +1,51 @@
+{
+    "name": "ejoi8/malaysia-payment-gateway",
+    "description": "Malaysian payment gateway integrations for Laravel (Chip, ToyyibPay, FPX) plus Stripe & PayPal",
+    "keywords": ["laravel", "payment", "gateway", "malaysia", "fpx", "chip", "toyyibpay", "stripe", "paypal"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "ejoi8",
+            "email": "ejoi8@example.com"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^10.0|^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^8.0|^9.0|^10.0",
+        "pestphp/pest": "^2.0|^3.0",
+        "phpunit/phpunit": "^10.0|^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ejoi8\\MalaysiaPaymentGateway\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ejoi8\\MalaysiaPaymentGateway\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit",
+        "test-coverage": "vendor/bin/phpunit --coverage-html coverage"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Ejoi8\\MalaysiaPaymentGateway\\PaymentGatewayServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    }
+}
+
