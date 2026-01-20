@@ -28,6 +28,7 @@ return [
     'gateways' => [
 
         'chip' => [
+            'enabled' => env('CHIP_ENABLED', true),
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\ChipGateway::class,
             'brand_id' => env('CHIP_BRAND_ID'),
             'secret_key' => env('CHIP_SECRET_KEY'),
@@ -36,6 +37,7 @@ return [
         ],
 
         'toyyibpay' => [
+            'enabled' => env('TOYYIBPAY_ENABLED', true),
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\ToyyibPayGateway::class,
             'secret_key' => env('TOYYIBPAY_SECRET_KEY'),
             'category_code' => env('TOYYIBPAY_CATEGORY_CODE'),
@@ -46,6 +48,7 @@ return [
         ],
 
         'stripe' => [
+            'enabled' => env('STRIPE_ENABLED', true),
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\StripeGateway::class,
             'public_key' => env('STRIPE_PUBLIC_KEY'),
             'secret_key' => env('STRIPE_SECRET_KEY'),
@@ -54,6 +57,7 @@ return [
         ],
 
         'paypal' => [
+            'enabled' => env('PAYPAL_ENABLED', true),
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\PayPalGateway::class,
             'client_id' => env('PAYPAL_CLIENT_ID'),
             'client_secret' => env('PAYPAL_CLIENT_SECRET'),
@@ -62,6 +66,7 @@ return [
         ],
 
         'manual_proof' => [
+            'enabled' => true,
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\ManualProofGateway::class,
             'currency' => env('PAYMENT_DEFAULT_CURRENCY', 'MYR'),
         ],
@@ -80,7 +85,7 @@ return [
     'settings' => [
         // Default currency for all gateways (can be overridden per gateway)
         'default_currency' => env('PAYMENT_DEFAULT_CURRENCY', 'MYR'),
-        
+
         // Maximum line items before aggregation
         'max_items' => env('PAYMENT_MAX_ITEMS', 10),
     ],
@@ -152,11 +157,11 @@ return [
 
     'notifications' => [
         'enabled' => env('PAYMENT_NOTIFICATIONS_ENABLED', true),
-        
+
         // Use queue for sending emails (recommended for production)
         // Set to true if you have a queue worker running
         'queue' => env('PAYMENT_NOTIFICATIONS_QUEUE', false),
-        
+
         // Which emails to send
         'email_success' => true,
         'email_failure' => true,

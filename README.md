@@ -20,15 +20,15 @@ A Laravel package for payment gateway integrations. Supports Malaysian gateways 
 
 ```json
 {
-    "repositories": [
-        {
-            "type": "path",
-            "url": "./packages/malaysia-payment-gateway"
-        }
-    ],
-    "require": {
-        "ejoi8/malaysia-payment-gateway": "*"
+  "repositories": [
+    {
+      "type": "path",
+      "url": "./packages/malaysia-payment-gateway"
     }
+  ],
+  "require": {
+    "ejoi8/malaysia-payment-gateway": "*"
+  }
 }
 ```
 
@@ -369,6 +369,47 @@ Event::listen(PaymentSucceeded::class, function ($event) {
         $booking->update(['status' => 'confirmed']);
     }
 });
+```
+
+### Option 2: Using an Event Subscriber (Recommended)
+
+Keep your `AppServiceProvider` clean by grouping listeners together.
+
+**1. Create the Listener:**
+
+```php
+namespace App\Listeners;
+
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
+
+class UpdateOrderPaymentStatus
+{
+    public function handleSuccess(PaymentSucceeded $event) {
+        // $event->payable, $event->gateway, $event->transactionId
+    }
+
+    public function handleFailure(PaymentFailed $event) {
+        // $event->payable, $event->error
+    }
+
+    public function subscribe($events)
+    {
+        return [
+            PaymentSucceeded::class => 'handleSuccess',
+            PaymentFailed::class => 'handleFailure',
+        ];
+    }
+}
+```
+
+**2. Register in `AppServiceProvider`:**
+
+```php
+public function boot(): void
+{
+    Event::subscribe(UpdateOrderPaymentStatus::class);
+}
 ```
 
 ### Available Events

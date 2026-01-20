@@ -7,6 +7,13 @@ namespace Ejoi8\MalaysiaPaymentGateway\Contracts;
  *
  * Implement this interface on your models (Booking, Order, Subscription, etc.)
  * to make them compatible with the payment gateway system.
+ *
+ * Recommended database columns for your model:
+ * - status (string): To store payment status (pending, paid, failed)
+ * - gateway (string, nullable): To store the used payment gateway (chip, toyyibpay, etc.)
+ * - transaction_id (string, nullable): To store the gateway's transaction ID
+ * - items (json, nullable): To store line items for the payment
+ * - metadata (json, nullable): To store additional payment data or failure reasons
  */
 interface PayableInterface
 {
@@ -59,8 +66,6 @@ interface PayableInterface
 
     /**
      * Find a payable record by its reference identifier.
-     * 
-     * @param string $reference
      */
     public static function findByReference(string $reference): ?self;
 }

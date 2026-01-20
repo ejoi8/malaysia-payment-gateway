@@ -261,6 +261,7 @@ class StripeGateway implements GatewayInterface
         $customer = $payable->getPaymentCustomer();
         $urls = $payable->getPaymentUrls();
         $items = $payable->getPaymentItems();
+        $reference = $payable->getPaymentReference();
 
         $lineItems = array_map(fn ($item, $i) => [
             "line_items[$i][price_data][currency]" => strtolower($payable->getPaymentCurrency()),
@@ -275,8 +276,17 @@ class StripeGateway implements GatewayInterface
             'mode' => 'payment',
             'success_url' => ($urls['return_url'] ?? '').'?session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $urls['cancel_url'] ?? $urls['return_url'] ?? '',
-            'client_reference_id' => $payable->getPaymentReference(),
+            'client_reference_id' => $reference,
             'customer_email' => $customer['email'] ?? null,
+            // Attach reference to metadata so PaymentIntent events can also identify the order
+            'metadata' => [
+                'reference' => $reference,
+            ],
+            'payment_intent_data' => [
+                'metadata' => [
+                    'reference' => $reference,
+                ],
+            ],
         ]);
     }
 
@@ -298,17 +308,7 @@ class StripeGateway implements GatewayInterface
     public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
     {
         // Mode 1: Return URL callback (session_id in query string)
-        // For return URL, we need to retrieve the session to get client_reference_id
-        // However, the controller can't do this here since we need to call API
-        // So we store the session_id temporarily, and verify() will extract the reference
         if ($request->has('session_id') && ! $request->has('type')) {
-            // For return URL, we'll use session_id as the identifier
-            // The verify() method will call Stripe API to get the actual reference
-            // This means the controller needs to handle this case differently
-            // OR we return null and let the caller handle session_id lookup
-
-            // We need to call Stripe API here to get client_reference_id
-            // But we don't have PayableInterface here, so we use config credentials
             $settings = config('payment-gateway.gateways.stripe', []);
             $secretKey = $this->secretKey ?? $settings['secret_key'] ?? '';
 
@@ -316,14 +316,25 @@ class StripeGateway implements GatewayInterface
                 ->get($this->getApiUrl().'/checkout/sessions/'.$request->input('session_id'));
 
             if ($response->successful()) {
-                return $response->json()['client_reference_id'] ?? null;
+                $data = $response->json();
+                return $data['client_reference_id']
+                    ?? $data['metadata']['reference']
+                    ?? null;
             }
 
             return null;
         }
 
-        // Mode 2: Webhook callback (data.object.client_reference_id in body)
-        return $request->input('data.object.client_reference_id');
+        // Mode 2: Webhook callback
+        // Try getting from client_reference_id (Checkout Session)
+        $reference = $request->input('data.object.client_reference_id');
+
+        // Check for metadata.reference (fallback for PaymentIntent or if client_ref missing)
+        if (! $reference) {
+            $reference = $request->input('data.object.metadata.reference');
+        }
+
+        return $reference;
     }
 
     public function checkStatus(PayableInterface $payable): array
