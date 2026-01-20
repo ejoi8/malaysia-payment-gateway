@@ -2,7 +2,6 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Http\Controllers;
 
-use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
 use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\GatewayManager;
 use Illuminate\Http\Request;

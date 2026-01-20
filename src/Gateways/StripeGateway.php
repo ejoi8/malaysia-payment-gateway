@@ -292,12 +292,76 @@ class StripeGateway implements GatewayInterface
 
     public function verifySignature(\Illuminate\Http\Request $request): bool
     {
-        // Stripe verifies webhooks using a signing secret and signature header.
-        // Implementation would use standard Stripe library or manual HMAC check.
-        // $sig_header = $request->header('Stripe-Signature');
-        // $webhook_secret = config('payment-gateway.gateways.stripe.webhook_secret');
-        // ... verify ...
-        return true;
+        $webhookSecret = config('payment-gateway.gateways.stripe.webhook_secret');
+
+        // Skip verification if no secret configured (development only)
+        if (empty($webhookSecret)) {
+            \Log::warning('Stripe webhook signature verification skipped - no secret configured');
+
+            return true;
+        }
+
+        $signature = $request->header('Stripe-Signature');
+        if (! $signature) {
+            \Log::error('Stripe webhook: Missing Stripe-Signature header');
+
+            return false;
+        }
+
+        $payload = $request->getContent();
+
+        try {
+            // Parse signature header
+            // Format: t=timestamp,v1=signature1,v1=signature2
+            $elements = explode(',', $signature);
+            $timestamp = null;
+            $signatures = [];
+
+            foreach ($elements as $element) {
+                $parts = explode('=', $element, 2);
+                if (count($parts) === 2) {
+                    if ($parts[0] === 't') {
+                        $timestamp = $parts[1];
+                    } elseif ($parts[0] === 'v1') {
+                        $signatures[] = $parts[1];
+                    }
+                }
+            }
+
+            if (! $timestamp || empty($signatures)) {
+                \Log::error('Stripe webhook: Invalid signature format');
+
+                return false;
+            }
+
+            // Verify timestamp is recent (within 5 minutes)
+            $currentTime = time();
+            if (abs($currentTime - $timestamp) > 300) {
+                \Log::error('Stripe webhook: Timestamp too old or too far in future');
+
+                return false;
+            }
+
+            // Construct signed payload
+            $signedPayload = "{$timestamp}.{$payload}";
+            $expectedSignature = hash_hmac('sha256', $signedPayload, $webhookSecret);
+
+            // Compare signatures (constant-time comparison)
+            foreach ($signatures as $sig) {
+                if (hash_equals($expectedSignature, $sig)) {
+                    return true;
+                }
+            }
+
+            \Log::error('Stripe webhook: Signature verification failed');
+
+            return false;
+
+        } catch (\Exception $e) {
+            \Log::error('Stripe webhook signature verification error: '.$e->getMessage());
+
+            return false;
+        }
     }
 
     public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
