@@ -279,14 +279,9 @@ class StripeGateway implements GatewayInterface
             'client_reference_id' => $reference,
             'customer_email' => $customer['email'] ?? null,
             // Attach reference to metadata so PaymentIntent events can also identify the order
-            'metadata' => [
-                'reference' => $reference,
-            ],
-            'payment_intent_data' => [
-                'metadata' => [
-                    'reference' => $reference,
-                ],
-            ],
+            // Use bracket notation for form-encoded API
+            'metadata[reference]' => $reference,
+            'payment_intent_data[metadata][reference]' => $reference,
         ]);
     }
 
@@ -317,6 +312,7 @@ class StripeGateway implements GatewayInterface
 
             if ($response->successful()) {
                 $data = $response->json();
+
                 return $data['client_reference_id']
                     ?? $data['metadata']['reference']
                     ?? null;
