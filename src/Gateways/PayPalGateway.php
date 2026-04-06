@@ -6,6 +6,7 @@ use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * PayPal payment gateway.
@@ -129,7 +130,7 @@ class PayPalGateway implements GatewayInterface
         // Capture the order - PayPal requires empty JSON object {} as body
         $captureUrl = $this->getApiUrl()."/v2/checkout/orders/{$orderId}/capture";
 
-        \Log::info('PayPal: Attempting to capture order', [
+        Log::debug('PayPal capture attempt', [
             'order_id' => $orderId,
             'url' => $captureUrl,
         ]);
@@ -140,9 +141,9 @@ class PayPalGateway implements GatewayInterface
 
         $responseData = $response->json();
 
-        \Log::info('PayPal: Capture response', [
+        Log::debug('PayPal capture response', [
+            'order_id' => $orderId,
             'status_code' => $response->status(),
-            'response' => $responseData,
         ]);
 
         if ($response->successful()) {
@@ -165,11 +166,10 @@ class PayPalGateway implements GatewayInterface
             ?? $responseData['error_description']
             ?? 'Payment capture failed';
 
-        // Log the full error for debugging
-        \Log::error('PayPal: Capture failed', [
+        Log::error('PayPal capture failed', [
             'order_id' => $orderId,
+            'status_code' => $response->status(),
             'error' => $errorMessage,
-            'full_response' => $responseData,
         ]);
 
         return [
@@ -232,8 +232,8 @@ class PayPalGateway implements GatewayInterface
 
     protected function getAccessTokenFromConfig(array $settings): ?string
     {
-        $clientId = $this->clientId ?? $settings['paypal_client_id'] ?? '';
-        $clientSecret = $this->clientSecret ?? $settings['paypal_client_secret'] ?? '';
+        $clientId = $this->setting($settings, 'client_id', 'paypal_client_id', $this->clientId ?? '');
+        $clientSecret = $this->setting($settings, 'client_secret', 'paypal_client_secret', $this->clientSecret ?? '');
 
         $response = Http::withBasicAuth($clientId, $clientSecret)
             ->asForm()
@@ -349,5 +349,26 @@ class PayPalGateway implements GatewayInterface
             'status' => 'pending',
             'message' => 'Status check implemented (Stub for PayPal).',
         ];
+    }
+
+    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
+    {
+        $config = config('payment-gateway.gateways.paypal', []);
+
+        foreach ([$key, $legacyKey] as $candidate) {
+            if (! $candidate) {
+                continue;
+            }
+
+            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
+                return $settings[$candidate];
+            }
+
+            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
+                return $config[$candidate];
+            }
+        }
+
+        return $default;
     }
 }

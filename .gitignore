@@ -5,7 +5,9 @@
 /storage/*.key
 /.idea
 /.vscode
+.codex
 *.lock
 .env
 .phpunit.result.cache
+.phpunit.cache/
 /build

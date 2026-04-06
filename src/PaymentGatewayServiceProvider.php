@@ -2,6 +2,12 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway;
 
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentInitiated;
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
+use Ejoi8\MalaysiaPaymentGateway\Listeners\SendPaymentNotification;
+use Ejoi8\MalaysiaPaymentGateway\Listeners\UpdatePaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Support\GatewayFactory;
 use Illuminate\Support\ServiceProvider;
 
 class PaymentGatewayServiceProvider extends ServiceProvider
@@ -40,62 +46,15 @@ class PaymentGatewayServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        // 1. Load Package Resources
-        // We load the views providing the checkout and status pages.
         $this->loadViewsFrom(__DIR__.'/../resources/views', 'payment-gateway');
 
-        // 2. Register Publishing Commands (Console Only)
-        // If the application is running in the console (e.g., artisan commands),
-        // we register the commands to publish config, views, and migrations.
         if ($this->app->runningInConsole()) {
-            // Load package migrations
             $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
-
-            // Publish configuration file
-            $this->publishes([
-                __DIR__.'/../config/payment-gateway.php' => config_path('payment-gateway.php'),
-            ], 'payment-gateway-config');
-
-            // Publish views
-            $this->publishes([
-                __DIR__.'/../resources/views' => resource_path('views/vendor/payment-gateway'),
-            ], 'payment-gateway-views');
-
-            // Publish migrations
-            $this->publishes([
-                __DIR__.'/../database/migrations' => database_path('migrations'),
-            ], 'payment-gateway-migrations');
+            $this->registerPublishes();
         }
 
-        // 3. Register Routes
         $this->loadRoutesFrom(__DIR__.'/../routes/web.php');
-
-        // 4. Register Event Listeners
-        // We listen for payment events to trigger notifications and status updates.
-
-        // Listeners for Notifications (e.g., Email, SMS)
-        $this->app['events']->listen(
-            \Ejoi8\MalaysiaPaymentGateway\Events\PaymentInitiated::class,
-            \Ejoi8\MalaysiaPaymentGateway\Listeners\SendPaymentNotification::class
-        );
-        $this->app['events']->listen(
-            \Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded::class,
-            \Ejoi8\MalaysiaPaymentGateway\Listeners\SendPaymentNotification::class
-        );
-        $this->app['events']->listen(
-            \Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed::class,
-            \Ejoi8\MalaysiaPaymentGateway\Listeners\SendPaymentNotification::class
-        );
-
-        // Listeners for Status Updates (e.g., updating database records)
-        $this->app['events']->listen(
-            \Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded::class,
-            \Ejoi8\MalaysiaPaymentGateway\Listeners\UpdatePaymentStatus::class
-        );
-        $this->app['events']->listen(
-            \Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed::class,
-            \Ejoi8\MalaysiaPaymentGateway\Listeners\UpdatePaymentStatus::class
-        );
+        $this->registerEventListeners();
     }
 
     /**
@@ -107,29 +66,41 @@ class PaymentGatewayServiceProvider extends ServiceProvider
         $gateways = config('payment-gateway.gateways', []);
 
         foreach ($gateways as $name => $config) {
-            // Skip gateways that don't have a driver class defined.
-            if (empty($config['driver_class'])) {
+            if (($config['enabled'] ?? true) === false || empty($config['driver_class'])) {
                 continue;
             }
 
-            // Register the driver with the GatewayManager.
-            // We use a closure to defer instantiation until the driver is actually needed.
             $manager->extend($name, function ($app) use ($name) {
                 $customConfig = config("payment-gateway.gateways.{$name}");
-                $class = $customConfig['driver_class'] ?? null;
 
-                if (! $class) {
-                    throw new \InvalidArgumentException("Driver class not defined for gateway [{$name}].");
-                }
-
-                // If the driver class has a static 'make' method (Factory Pattern), use it.
-                if (method_exists($class, 'make')) {
-                    return $class::make($customConfig);
-                }
-
-                // Otherwise, simple instantiation.
-                return new $class;
+                return GatewayFactory::make($customConfig);
             });
+        }
+    }
+
+    protected function registerPublishes(): void
+    {
+        $this->publishes([
+            __DIR__.'/../config/payment-gateway.php' => config_path('payment-gateway.php'),
+        ], 'payment-gateway-config');
+
+        $this->publishes([
+            __DIR__.'/../resources/views' => resource_path('views/vendor/payment-gateway'),
+        ], 'payment-gateway-views');
+
+        $this->publishes([
+            __DIR__.'/../database/migrations' => database_path('migrations'),
+        ], 'payment-gateway-migrations');
+    }
+
+    protected function registerEventListeners(): void
+    {
+        foreach ([PaymentInitiated::class, PaymentSucceeded::class, PaymentFailed::class] as $event) {
+            $this->app['events']->listen($event, SendPaymentNotification::class);
+        }
+
+        foreach ([PaymentSucceeded::class, PaymentFailed::class] as $event) {
+            $this->app['events']->listen($event, UpdatePaymentStatus::class);
         }
     }
 

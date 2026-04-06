@@ -14,6 +14,10 @@ namespace Ejoi8\MalaysiaPaymentGateway\Contracts;
  * - transaction_id (string, nullable): To store the gateway's transaction ID
  * - items (json, nullable): To store line items for the payment
  * - metadata (json, nullable): To store additional payment data or failure reasons
+ *
+ * Automatic status updates work best when your payable is an Eloquent model
+ * with the columns above. If you use different field names, add an
+ * `applyPaymentGatewayUpdate(array $attributes): void` method on the model.
  */
 interface PayableInterface
 {

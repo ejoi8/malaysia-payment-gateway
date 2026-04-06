@@ -5,17 +5,24 @@ namespace Ejoi8\MalaysiaPaymentGateway\Gateways;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 
 /**
  * Manual proof gateway (bank transfer with receipt upload).
  */
 class ManualProofGateway implements GatewayInterface
 {
-    public function __construct() {}
+    public function __construct(
+        protected ?string $message = null,
+        protected ?string $bankInfo = null
+    ) {}
 
     public static function make(array $config): self
     {
-        return new self();
+        return new self(
+            message: $config['message'] ?? null,
+            bankInfo: $config['bank_info'] ?? null
+        );
     }
 
     public function getName(): string
@@ -34,8 +41,16 @@ class ManualProofGateway implements GatewayInterface
 
         return [
             'type' => 'instructions',
-            'message' => $settings['manual_proof_message'] ?? 'Please make a bank transfer and upload your payment receipt.',
-            'bank_info' => $settings['bank_account_info'] ?? 'Contact administrator for bank details.',
+            'message' => $settings['message']
+                ?? $settings['manual_proof_message']
+                ?? $this->message
+                ?? config('payment-gateway.gateways.manual_proof.message')
+                ?? 'Please make a bank transfer and upload your payment receipt.',
+            'bank_info' => $settings['bank_info']
+                ?? $settings['bank_account_info']
+                ?? $this->bankInfo
+                ?? config('payment-gateway.gateways.manual_proof.bank_info')
+                ?? 'Contact administrator for bank details.',
             'reference' => $payable->getPaymentReference(),
             'amount' => $payable->getPaymentAmount(),
             'currency' => $payable->getPaymentCurrency(),
@@ -98,7 +113,7 @@ class ManualProofGateway implements GatewayInterface
     {
         // Manual proof status is managed internally, not via external API
         return [
-            'status' => 'pending_verification',
+            'status' => PaymentStatus::PENDING_VERIFICATION->value,
             'message' => 'Awaiting manual verification by administrator.',
         ];
     }

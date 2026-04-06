@@ -26,8 +26,8 @@ class ChipGatewayTest extends TestCase
     public function test_it_supports_refunds(): void
     {
         $gateway = new ChipGateway;
-
-        $this->assertTrue($gateway->supportsRefunds());
+        
+        $this->assertFalse($gateway->supportsRefunds());
     }
 
     public function test_it_initiates_payment_with_correct_structure(): void
@@ -100,7 +100,7 @@ class ChipGatewayTest extends TestCase
         $gateway = new ChipGateway;
         $payable = new MockPayable(
             amount: 10000,
-            settings: ['payment_item_max' => 2],
+            settings: ['max_items' => 2],
             items: [
                 ['name' => 'Item 1', 'quantity' => 1, 'price' => 2500],
                 ['name' => 'Item 2', 'quantity' => 1, 'price' => 2500],

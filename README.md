@@ -1,22 +1,27 @@
 # Malaysia Payment Gateway
 
-A Laravel package for payment gateway integrations. Supports Malaysian gateways (CHIP, ToyyibPay) plus international gateways (Stripe, PayPal).
+A Laravel package for payment gateway integrations. Supports Malaysian gateways (CHIP, ToyyibPay) plus international gateways (Stripe, PayPal) and a manual proof flow.
 
 ## Features
 
 ✅ **Multiple Gateways** - CHIP, ToyyibPay, Stripe, PayPal, Manual Proof  
 ✅ **Unified API** - Same interface for all gateways  
-✅ **Automatic Webhooks** - Built-in webhook handling  
+✅ **Unified Callback Routes** - Built-in handling for gateway POST callbacks and GET returns  
 ✅ **Return URL Handling** - Unified callback for both webhooks and user returns  
-✅ **Status Portal** - Customer-facing payment tracking  
+✅ **Status Portal** - Customer-facing payment tracking based on stored payment state  
 ✅ **Email Notifications** - Automatic payment receipts  
+✅ **Custom Payable Models** - Use the built-in `Payment` model or your own model
 ✅ **Developer Sandbox** - Test gateways without writing code
+
+> **Current state:** this package is still installed as a local Composer path repository. It is not published on Packagist yet. Live `checkStatus()` polling is still stubbed for CHIP, ToyyibPay, Stripe, and PayPal, and webhook signature verification still needs production hardening for CHIP, ToyyibPay, and PayPal. Stripe signature verification works when `STRIPE_WEBHOOK_SECRET` is configured.
 
 ---
 
 ## Quick Start
 
 ### 1. Installation
+
+Until this package is published to Packagist, install it from a local path repository:
 
 ```json
 {
@@ -56,6 +61,7 @@ TOYYIBPAY_SANDBOX=true
 # Stripe
 STRIPE_PUBLIC_KEY=pk_test_xxx
 STRIPE_SECRET_KEY=sk_test_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
 
 # PayPal
 PAYPAL_CLIENT_ID=your-client-id
@@ -67,6 +73,15 @@ PAYMENT_DEFAULT_CURRENCY=MYR
 CHIP_CURRENCY=MYR
 STRIPE_CURRENCY=MYR
 PAYPAL_CURRENCY=MYR
+
+# Notifications / sandbox helpers
+PAYMENT_NOTIFICATIONS_ENABLED=true
+PAYMENT_NOTIFICATIONS_QUEUE=false
+PAYMENT_GATEWAY_SANDBOX=false
+
+# Manual proof (optional)
+MANUAL_PROOF_MESSAGE="Please transfer and send your receipt"
+MANUAL_PROOF_BANK_INFO="Maybank 1234567890"
 ```
 
 > **Note:** ToyyibPay is MYR-only. Other gateways can be configured to use different currencies.
@@ -195,13 +210,15 @@ GET  /payment/webhook/stripe  → Verify via session_id API call
 
 ## Supported Gateways
 
-| Gateway          | Type    | Webhook | Return URL | Refund |
-| ---------------- | ------- | ------- | ---------- | ------ |
-| **CHIP**         | Webhook | ✅      | ✅         | 🔜     |
-| **ToyyibPay**    | Webhook | ✅      | ✅         | ❌     |
-| **Stripe**       | API     | ✅      | ✅         | ✅     |
-| **PayPal**       | API     | ✅      | ✅         | ✅     |
-| **Manual Proof** | N/A     | ❌      | ❌         | ❌     |
+| Gateway          | Type    | Return URL | Refund | Notes |
+| ---------------- | ------- | ---------- | ------ | ----- |
+| **CHIP**         | Webhook | ✅         | Planned, not implemented yet | Callback handling built in, signature verification still stubbed |
+| **ToyyibPay**    | Webhook | ✅         | ❌ | Callback handling built in, signature verification still permissive |
+| **Stripe**       | API     | ✅         | ✅ | Webhook signature verification supported when `STRIPE_WEBHOOK_SECRET` is set |
+| **PayPal**       | API     | ✅         | ✅ | Return verification works, webhook signature verification still stubbed |
+| **Manual Proof** | Manual  | ❌         | Manual only | Status managed inside your app |
+
+The customer status page mainly shows the package's stored payment status. In the current implementation, gateway-side `checkStatus()` calls for CHIP, ToyyibPay, Stripe, and PayPal still return placeholder responses rather than a full live lookup.
 
 ---
 
@@ -231,6 +248,12 @@ return [
         'middleware' => ['web'],
     ],
 
+    // Shared package settings
+    'settings' => [
+        'default_currency' => env('PAYMENT_DEFAULT_CURRENCY', 'MYR'),
+        'max_items' => env('PAYMENT_MAX_ITEMS', 10),
+    ],
+
     // Status portal (customer tracking)
     'status_portal' => [
         'enabled' => true,
@@ -239,18 +262,23 @@ return [
 
     // Email notifications
     'notifications' => [
-        'enabled' => true,
-        'email_on_initiate' => true,
-        'email_on_success' => true,
-        'email_on_failure' => true,
+        'enabled' => env('PAYMENT_NOTIFICATIONS_ENABLED', true),
+        'queue' => env('PAYMENT_NOTIFICATIONS_QUEUE', false),
+        'email_success' => true,
+        'email_failure' => true,
+        'email_initiated' => true,
     ],
 
     // Developer sandbox
     'sandbox' => [
         'enabled' => env('PAYMENT_GATEWAY_SANDBOX', false),
+        'prefix' => 'payment-gateway',
+        'middleware' => ['web'],
     ],
 ];
 ```
+
+`routes.middleware` currently applies to the status pages. The webhook route is registered separately at `/payment/webhook/{driver}` with `api` middleware in the current implementation.
 
 ---
 
@@ -261,6 +289,7 @@ return [
 | `/payment/webhook/{driver}`   | GET/POST | Unified callback for webhooks and returns |
 | `/payment/status/{reference}` | GET      | Payment status page for customer          |
 | `/payment/check-status`       | GET      | Status portal (search by reference)       |
+| `/payment/check-status/search`| GET      | Status portal search endpoint             |
 | `/payment-gateway/sandbox`    | GET      | Developer sandbox (when enabled)          |
 
 ---
@@ -321,7 +350,8 @@ class Booking extends Model implements PayableInterface
 
     public function getPaymentUrls(): array
     {
-        $webhookUrl = route('payment-gateway.webhook', ['driver' => $this->gateway]);
+        $driver = $this->gateway ?? config('payment-gateway.default', 'chip');
+        $webhookUrl = route('payment-gateway.webhook', ['driver' => $driver]);
 
         return [
             'return_url' => $webhookUrl,
@@ -337,11 +367,64 @@ class Booking extends Model implements PayableInterface
 }
 ```
 
-### 2. Update Config
+### 2. Recommended Columns / Update Hook
+
+The package works best when your model has these fields:
+
+- `status`
+- `gateway`
+- `transaction_id`
+- `items`
+- `metadata`
+
+If your model uses different field names, add a small mapper so package events can still update it automatically:
+
+```php
+public function applyPaymentGatewayUpdate(array $attributes): void
+{
+    if (isset($attributes['status'])) {
+        $this->payment_state = $attributes['status'];
+    }
+
+    if (isset($attributes['transaction_id'])) {
+        $this->gateway_transaction_ref = $attributes['transaction_id'];
+    }
+
+    if (isset($attributes['metadata'])) {
+        $this->payment_meta = $attributes['metadata'];
+    }
+
+    $this->save();
+}
+```
+
+### 3. Update Config
 
 ```php
 // config/payment-gateway.php
 'model' => \App\Models\Booking::class,
+```
+
+### 4. Sandbox Support For Custom Models
+
+The developer sandbox now honors `payment-gateway.model`.
+
+If your custom model uses the package-style columns (`reference`, `amount`, `currency`, `description`, etc.), the sandbox can create records automatically.
+
+If your model uses different field names, add a static factory:
+
+```php
+public static function createForSandbox(array $attributes): static
+{
+    return static::create([
+        'reference_number' => $attributes['reference'],
+        'total_amount' => $attributes['amount'],
+        'currency_code' => $attributes['currency'],
+        'description_text' => $attributes['description'],
+        'payment_gateway' => $attributes['gateway'],
+        'payment_state' => $attributes['status'],
+    ]);
+}
 ```
 
 ---
@@ -353,21 +436,14 @@ Listen for these events to add custom logic:
 ```php
 // In EventServiceProvider or listener
 
-use Ejoi8\MalaysiaPaymentGateway\Events\PaymentInitiated;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
-use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
 
-// Example: Update booking status after payment succeeds
-Event::listen(PaymentSucceeded::class, function ($event) {
-    $payment = $event->payable;
-
-    // Your custom logic
-    Log::info("Payment successful: {$payment->getPaymentReference()}");
-
-    // Maybe update related booking
-    if ($booking = Booking::find($payment->metadata['booking_id'])) {
-        $booking->update(['status' => 'confirmed']);
-    }
+Event::listen(PaymentSucceeded::class, function (PaymentSucceeded $event) {
+    Log::info('Payment successful', [
+        'reference' => $event->payable->getPaymentReference(),
+        'gateway' => $event->gateway,
+        'transaction_id' => $event->transactionId,
+    ]);
 });
 ```
 
@@ -435,14 +511,19 @@ PAYMENT_GATEWAY_SANDBOX=true
 
 ### Access
 
-Visit `/payment-gateway/sandbox` in your browser.
+Visit `/payment-gateway/sandbox` in your browser by default. Both the prefix and middleware are configurable under `payment-gateway.sandbox`.
 
 ### Features
 
 - Test all configured gateways
+- Respects gateway `enabled` flags
 - Override credentials on-the-fly
-- Multiple payment scenarios (simple, invoice, booking, e-commerce)
+- Multiple payment scenarios:
+  simple, invoice, booking, e-commerce, event, subscription
+- Uses the configured `payment-gateway.model`
 - View raw API responses
+
+If your configured payable model does not use the package-style columns, add `createForSandbox(array $attributes)` as shown above.
 
 ⚠️ **Never enable in production!**
 
@@ -477,7 +558,7 @@ $successStatuses = PaymentStatus::successStatuses();
 // Returns: ['paid', 'successful', 'success', 'completed']
 
 $pendingStatuses = PaymentStatus::pendingStatuses();
-// Returns: ['pending', 'created']
+// Returns: ['pending', 'created', 'pending_verification']
 
 // Get human-readable message
 $message = PaymentStatus::getMessage('paid');
@@ -503,6 +584,7 @@ $payment->status = PaymentStatus::defaultPendingStatus();  // 'pending'
 | `COMPLETED`  | `'completed'`  | Success  |
 | `PENDING`    | `'pending'`    | Pending  |
 | `CREATED`    | `'created'`    | Pending  |
+| `PENDING_VERIFICATION` | `'pending_verification'` | Pending |
 | `FAILED`     | `'failed'`     | Failed   |
 | `CANCELLED`  | `'cancelled'`  | Failed   |
 | `EXPIRED`    | `'expired'`    | Failed   |
@@ -572,12 +654,18 @@ In your CHIP dashboard, set the callback URL to:
 https://your-domain.com/payment/webhook/chip
 ```
 
+Current caveat: callback extraction works, but signature verification is still stubbed in the package.
+
 ### ToyyibPay
 
 When creating bills, the package automatically sets:
 
 - `billCallbackUrl` → `/payment/webhook/toyyibpay`
-- `billReturnUrl` → `/payment/webhook/toyyibpay?reference=XXX`
+- `billReturnUrl` → `/payment/webhook/toyyibpay`
+
+ToyyibPay callbacks/returns are identified from payload fields such as `order_id`, `billcode`, or `refno`.
+
+Current caveat: ToyyibPay callback verification is still permissive because the package does not yet implement stronger authenticity checks.
 
 ### Stripe
 
@@ -590,6 +678,10 @@ Webhook URL: https://your-domain.com/payment/webhook/stripe
 Events: checkout.session.completed, payment_intent.succeeded
 ```
 
+The package also supports GET return verification using the `session_id` Stripe appends to the success URL.
+
+For webhook signature verification, set `STRIPE_WEBHOOK_SECRET`.
+
 ### PayPal
 
 PayPal works without configuring webhooks (uses return URL verification).
@@ -601,6 +693,10 @@ Webhook URL: https://your-domain.com/payment/webhook/paypal
 Events: PAYMENT.CAPTURE.COMPLETED
 ```
 
+The package also supports GET return verification using PayPal's `token` / `orderID` query parameters.
+
+Current caveat: PayPal webhook signature verification is still stubbed. The GET return flow is currently the more complete path.
+
 ---
 
 ## Testing
@@ -608,8 +704,8 @@ Events: PAYMENT.CAPTURE.COMPLETED
 Run the package tests:
 
 ```bash
-cd packages/malaysia-payment-gateway
-./vendor/bin/phpunit
+composer install
+vendor/bin/phpunit
 ```
 
 ---
@@ -617,7 +713,7 @@ cd packages/malaysia-payment-gateway
 ## Requirements
 
 - PHP 8.2+
-- Laravel 10.x or 11.x
+- Laravel 10.x, 11.x, or 12.x
 
 ---
 

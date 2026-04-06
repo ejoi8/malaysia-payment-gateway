@@ -150,7 +150,9 @@ class ToyyibPayGateway implements GatewayInterface
         $urls = $payable->getPaymentUrls();
         $items = $payable->getPaymentItems();
 
-        $maxItems = (int) ($settings['payment_item_max'] ?? 5);
+        $maxItems = (int) ($settings['max_items']
+            ?? $settings['payment_item_max']
+            ?? config('payment-gateway.settings.max_items', 5));
         $billName = $payable->getPaymentReference();
 
         if (count($items) > $maxItems) {
@@ -158,8 +160,8 @@ class ToyyibPayGateway implements GatewayInterface
         }
 
         return [
-            'userSecretKey' => $this->secretKey ?? $settings['toyyibpay_secret_key'] ?? '',
-            'categoryCode' => $this->categoryCode ?? $settings['toyyibpay_category_code'] ?? '',
+            'userSecretKey' => $this->setting($settings, 'secret_key', 'toyyibpay_secret_key', ''),
+            'categoryCode' => $this->setting($settings, 'category_code', 'toyyibpay_category_code', ''),
             'billName' => $billName,
             'billDescription' => $payable->getPaymentDescription(),
             'billPriceSetting' => 0,
@@ -175,9 +177,9 @@ class ToyyibPayGateway implements GatewayInterface
             'billSplitPaymentArgs' => '',
             'billPaymentChannel' => '0',
             'billContentEmail' => 'Thank you for your payment.',
-            'billChargeToCustomer' => $settings['toyyibpay_charge_customer'] ?? 1,
+            'billChargeToCustomer' => $this->setting($settings, 'charge_customer', 'toyyibpay_charge_customer', 1),
             'billExpiryDate' => null,
-            'billExpiryDays' => $settings['toyyibpay_expiry_days'] ?? 3,
+            'billExpiryDays' => $this->setting($settings, 'expiry_days', 'toyyibpay_expiry_days', 3),
         ];
     }
 
@@ -217,5 +219,30 @@ class ToyyibPayGateway implements GatewayInterface
             'status' => 'pending',
             'message' => 'Status check implemented (Stub for ToyyibPay).',
         ];
+    }
+
+    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
+    {
+        $config = config('payment-gateway.gateways.toyyibpay', []);
+
+        foreach ([$key, $legacyKey] as $candidate) {
+            if (! $candidate) {
+                continue;
+            }
+
+            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
+                return $settings[$candidate];
+            }
+
+            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
+                return $config[$candidate];
+            }
+        }
+
+        return match ($key) {
+            'secret_key' => $this->secretKey ?? $default,
+            'category_code' => $this->categoryCode ?? $default,
+            default => $default,
+        };
     }
 }

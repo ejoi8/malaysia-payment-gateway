@@ -69,6 +69,8 @@ return [
             'enabled' => true,
             'driver_class' => \Ejoi8\MalaysiaPaymentGateway\Gateways\ManualProofGateway::class,
             'currency' => env('PAYMENT_DEFAULT_CURRENCY', 'MYR'),
+            'message' => env('MANUAL_PROOF_MESSAGE'),
+            'bank_info' => env('MANUAL_PROOF_BANK_INFO'),
         ],
 
     ],

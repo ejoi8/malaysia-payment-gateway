@@ -2,6 +2,7 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Tests\Unit;
 
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\Gateways\ManualProofGateway;
 use Ejoi8\MalaysiaPaymentGateway\Tests\MockPayable;
 use Ejoi8\MalaysiaPaymentGateway\Tests\TestCase;
@@ -34,8 +35,8 @@ class ManualProofGatewayTest extends TestCase
         $gateway = new ManualProofGateway();
         $payable = new MockPayable(
             settings: [
-                'manual_proof_message' => 'Please transfer to account 1234567890',
-                'bank_account_info' => 'Maybank: 1234567890',
+                'message' => 'Please transfer to account 1234567890',
+                'bank_info' => 'Maybank: 1234567890',
             ]
         );
 
@@ -106,5 +107,14 @@ class ManualProofGatewayTest extends TestCase
 
         $this->assertFalse($result['success']);
         $this->assertStringContainsString('manually', $result['error']);
+    }
+
+    public function test_check_status_uses_normalized_pending_verification_status(): void
+    {
+        $gateway = new ManualProofGateway();
+
+        $result = $gateway->checkStatus(new MockPayable());
+
+        $this->assertSame(PaymentStatus::PENDING_VERIFICATION->value, $result['status']);
     }
 }

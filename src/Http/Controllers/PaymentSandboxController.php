@@ -3,8 +3,16 @@
 namespace Ejoi8\MalaysiaPaymentGateway\Http\Controllers;
 
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\GatewayManager;
+use Ejoi8\MalaysiaPaymentGateway\Http\Controllers\Concerns\ResolvesPayables;
+use Ejoi8\MalaysiaPaymentGateway\Models\Payment;
+use Ejoi8\MalaysiaPaymentGateway\Support\GatewayFactory;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Schema;
+use InvalidArgumentException;
 
 /**
  * Payment Sandbox Controller
@@ -14,21 +22,16 @@ use Illuminate\Routing\Controller;
  */
 class PaymentSandboxController extends Controller
 {
+    use ResolvesPayables;
+
     /**
      * Display the sandbox form.
      */
     public function index()
     {
-        // Get all configured gateways (dynamic, not hardcoded)
-        $gateways = $this->getGatewayList();
-
-        // Get gateway-specific field definitions
-        $gatewayFields = $this->getGatewayFields();
-
-        // Get gateway configs for default values
-        $gatewayConfigs = config('payment-gateway.gateways', []);
-
-        // Payable type definitions
+        $gatewayConfigs = $this->configuredGateways();
+        $gateways = $this->getGatewayList($gatewayConfigs);
+        $gatewayFields = array_intersect_key($this->getGatewayFields(), $gatewayConfigs);
         $payableTypes = $this->getPayableTypes();
 
         return view('payment-gateway::sandbox', compact(
@@ -42,7 +45,7 @@ class PaymentSandboxController extends Controller
     /**
      * Process the payment initiation.
      */
-    public function initiate(Request $request, \Ejoi8\MalaysiaPaymentGateway\GatewayManager $manager)
+    public function initiate(Request $request, GatewayManager $manager)
     {
         $request->validate([
             'gateway' => 'required|string',
@@ -51,34 +54,34 @@ class PaymentSandboxController extends Controller
             'customer_email' => 'required|email',
         ]);
 
-        // Build the payable from form data
         $gatewayName = $request->input('gateway');
         $payable = $this->buildPayable($request, $gatewayName);
-
-        // Create gateway instance with user-provided credentials
         $gatewayInstance = $this->createGateway($request);
 
-        // Register this dynamic instance with the manager
-        // We use the actual gateway name to perfectly mimic the real flow
-        $manager->extend($gatewayName, fn () => $gatewayInstance);
-
-        // Initiate payment via the manager
-        // This ensures events (PaymentInitiated) are fired automatically with the correct driver name
+        $manager->extend($gatewayName, fn ($app) => $gatewayInstance);
         $result = $manager->initiate($gatewayName, $payable);
 
         return back()->with('sandbox_result', $result)->withInput();
     }
 
     /**
+     * Get enabled gateway configurations.
+     */
+    protected function configuredGateways(): array
+    {
+        return array_filter(
+            config('payment-gateway.gateways', []),
+            fn (array $config): bool => ($config['enabled'] ?? true) === true
+        );
+    }
+
+    /**
      * Get list of available gateways from config.
      */
-    protected function getGatewayList(): array
+    protected function getGatewayList(array $configs): array
     {
         $gateways = [];
-        $configs = config('payment-gateway.gateways', []);
-
         foreach ($configs as $key => $config) {
-            // Generate a readable name from the key
             $gateways[$key] = ucwords(str_replace('_', ' ', $key));
         }
 
@@ -180,7 +183,7 @@ class PaymentSandboxController extends Controller
     }
 
     /**
-     * Build a Payable object from the form data.
+     * Build a payment record from the form data.
      */
     protected function buildPayable(Request $request, string $gateway): PayableInterface
     {
@@ -191,11 +194,10 @@ class PaymentSandboxController extends Controller
             'phone' => $request->input('customer_phone', ''),
         ];
 
-        // Build items and amount based on payable type
         $items = [];
         $amount = 0;
         $description = 'Payment';
-        $reference = 'SBX-'.strtoupper(uniqid()); // Use SBX prefix to identify sandbox transactions
+        $reference = 'SBX-'.strtoupper(uniqid());
 
         switch ($type) {
             case 'simple':
@@ -209,7 +211,7 @@ class PaymentSandboxController extends Controller
                 $reference = $request->input('invoice_invoice_no', 'INV-001');
                 if ($reference === 'INV-001') {
                     $reference .= '-'.time();
-                } // Ensure unique
+                }
                 $description = 'Invoice '.$reference;
                 $items = [['name' => $description, 'quantity' => 1, 'price' => $amount]];
                 break;
@@ -255,12 +257,10 @@ class PaymentSandboxController extends Controller
                 break;
         }
 
-        // Determine currency from gateway config or use default
         $gatewayConfig = config("payment-gateway.gateways.{$gateway}", []);
         $currency = $gatewayConfig['currency'] ?? config('payment-gateway.settings.default_currency', 'MYR');
 
-        // Create REAL Payment record
-        return \Ejoi8\MalaysiaPaymentGateway\Models\Payment::create([
+        return $this->createSandboxPayable([
             'reference' => $reference,
             'amount' => $amount,
             'currency' => $currency,
@@ -270,7 +270,7 @@ class PaymentSandboxController extends Controller
             'customer_phone' => $customer['phone'],
             'items' => $items,
             'gateway' => $gateway,
-            'status' => 'pending',
+            'status' => PaymentStatus::defaultPendingStatus(),
             'metadata' => [
                 'source' => 'sandbox',
                 'payable_type' => $type,
@@ -284,108 +284,80 @@ class PaymentSandboxController extends Controller
     protected function createGateway(Request $request)
     {
         $gatewayName = $request->input('gateway');
-        $configKey = "payment-gateway.gateways.{$gatewayName}";
-        $config = config($configKey, []);
-        $driverClass = $config['driver_class'] ?? null;
+        $config = $this->configuredGateways()[$gatewayName] ?? [];
 
-        if (! $driverClass || ! class_exists($driverClass)) {
-            throw new \Exception("Gateway driver not found: {$gatewayName}");
+        if ($config === []) {
+            throw new InvalidArgumentException("Gateway driver not found: {$gatewayName}");
         }
 
-        // Merge user-provided values with config defaults
         $mergedConfig = [];
         $fields = $this->getGatewayFields()[$gatewayName] ?? [];
 
         foreach ($fields as $field) {
             $fieldName = $field['name'];
-            // Use gateway-prefixed input names to avoid collisions (e.g. chip_secret_key)
             $inputName = "{$gatewayName}_{$fieldName}";
             $userValue = $request->input($inputName);
 
-            // Use user value if provided (and not empty), otherwise fall back to config
             if ($field['type'] === 'checkbox') {
                 $mergedConfig[$fieldName] = $request->has($inputName);
             } else {
-                // Only use user value if it's not null AND not empty string
                 $mergedConfig[$fieldName] = (! empty($userValue))
                     ? $userValue
                     : ($config[$fieldName] ?? null);
             }
         }
 
-        // Debug: uncomment to see what's being passed
-        // dd($driverClass, $mergedConfig, $config);
-
-        // Create gateway using the make() factory method
-        return $driverClass::make($mergedConfig);
-    }
-}
-
-/**
- * Simple Payable implementation for sandbox testing.
- */
-class SandboxPayable implements PayableInterface
-{
-    public function __construct(
-        protected string $reference,
-        protected int $amount,
-        protected string $description,
-        protected array $customer,
-        protected array $items,
-        protected string $currency = 'MYR'
-    ) {}
-
-    public function getPaymentReference(): string
-    {
-        return $this->reference;
+        return GatewayFactory::make(array_merge($config, $mergedConfig));
     }
 
-    public function getPaymentAmount(): int
+    protected function createSandboxPayable(array $attributes): PayableInterface
     {
-        return $this->amount;
+        $modelClass = $this->configuredPayableModel();
+
+        if (method_exists($modelClass, 'createForSandbox')) {
+            $payable = $modelClass::createForSandbox($attributes);
+
+            if (! $payable instanceof PayableInterface) {
+                throw new InvalidArgumentException("Sandbox factory on [{$modelClass}] must return a PayableInterface instance.");
+            }
+
+            return $payable;
+        }
+
+        if (! is_subclass_of($modelClass, Model::class)) {
+            throw new InvalidArgumentException("Configured payable model [{$modelClass}] must extend Eloquent Model or implement createForSandbox(array \$attributes) for sandbox support.");
+        }
+
+        /** @var \Illuminate\Database\Eloquent\Model&\Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface $model */
+        $model = new $modelClass;
+
+        if ($model instanceof Payment) {
+            return Payment::create($attributes);
+        }
+
+        return $this->persistSandboxModel($model, $attributes);
     }
 
-    public function getPaymentCurrency(): string
+    protected function persistSandboxModel(Model $model, array $attributes): PayableInterface
     {
-        return $this->currency;
-    }
+        $requiredColumns = ['reference', 'amount', 'currency', 'description'];
+        $columns = Schema::connection($model->getConnectionName())
+            ->getColumnListing($model->getTable());
 
-    public function getPaymentDescription(): string
-    {
-        return $this->description;
-    }
+        $missingColumns = array_diff($requiredColumns, $columns);
 
-    public function getPaymentCustomer(): array
-    {
-        return $this->customer;
-    }
+        if ($missingColumns !== []) {
+            throw new InvalidArgumentException(sprintf(
+                'Sandbox cannot create [%s] automatically because table [%s] is missing required columns: %s. Add a static createForSandbox(array $attributes) method on the model to map custom fields.',
+                $model::class,
+                $model->getTable(),
+                implode(', ', $missingColumns)
+            ));
+        }
 
-    public function getPaymentItems(): array
-    {
-        return $this->items;
-    }
+        $model->forceFill(array_intersect_key($attributes, array_flip($columns)));
+        $model->save();
 
-    public function getPaymentUrls(): array
-    {
-        return [
-            'return_url' => url('/payment-gateway/sandbox?status=return'),
-            'cancel_url' => url('/payment-gateway/sandbox?status=cancel'),
-            'callback_url' => url('/payment-gateway/sandbox/callback'),
-        ];
-    }
-
-    public function getPaymentSettings(): array
-    {
-        return config('payment-gateway.settings', []);
-    }
-
-    public static function findByReference(string $reference): ?self
-    {
-        // For sandbox testing, we can return a dummy instance if the reference starts with 'test'
-        // or just return null to simulate not found.
-        // A better approach for the sandbox might be unnecessary complexity,
-        // as the sandbox is mostly for *creating* payments.
-        // However, to prevent interface errors if the sandbox model is used elsewhere:
-        return null;
+        return $model;
     }
 }

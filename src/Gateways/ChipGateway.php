@@ -41,10 +41,11 @@ class ChipGateway implements GatewayInterface
 
     public function initiate(PayableInterface $payable): array
     {
+        $settings = $payable->getPaymentSettings();
         $payload = $this->buildPayload($payable);
+        $secretKey = $this->setting($settings, 'secret_key', 'chip_secret_key', '');
 
-        // Make actual API call to CHIP
-        $response = Http::withToken($this->secretKey)
+        $response = Http::withToken($secretKey)
             ->post($this->getApiUrl().'/purchases/', $payload);
 
         if ($response->failed()) {
@@ -115,7 +116,7 @@ class ChipGateway implements GatewayInterface
 
     public function supportsRefunds(): bool
     {
-        return true;
+        return false;
     }
 
     public function refund(string $transactionId, ?int $amount = null): array
@@ -141,7 +142,9 @@ class ChipGateway implements GatewayInterface
         ], $items);
 
         // Aggregate if too many items
-        $maxItems = (int) ($settings['payment_item_max'] ?? 10);
+        $maxItems = (int) ($settings['max_items']
+            ?? $settings['payment_item_max']
+            ?? config('payment-gateway.settings.max_items', 10));
         if (count($products) > $maxItems) {
             $products = [[
                 'name' => 'Payment ('.count($items).' items)',
@@ -151,7 +154,7 @@ class ChipGateway implements GatewayInterface
         }
 
         return [
-            'brand_id' => $this->brandId ?? $settings['chip_brand_id'] ?? '',
+            'brand_id' => $this->setting($settings, 'brand_id', 'chip_brand_id', ''),
             'client' => [
                 'email' => $customer['email'] ?? '',
                 'phone' => $customer['phone'] ?? '',
@@ -167,7 +170,7 @@ class ChipGateway implements GatewayInterface
             'failure_redirect' => $this->appendReferenceToUrl($urls['cancel_url'] ?? $urls['return_url'] ?? '', $payable->getPaymentReference()),
             'success_callback' => $urls['callback_url'] ?? '',
             'reference' => $payable->getPaymentReference(),
-            'language' => $settings['chip_language'] ?? 'en',
+            'language' => $settings['language'] ?? $settings['chip_language'] ?? 'en',
         ];
     }
 
@@ -244,5 +247,26 @@ class ChipGateway implements GatewayInterface
             'status' => 'pending', // or 'paid'
             'message' => 'Status check implemented but requires Transaction ID storage logic enhancement.',
         ];
+    }
+
+    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
+    {
+        $config = config('payment-gateway.gateways.chip', []);
+
+        foreach ([$key, $legacyKey] as $candidate) {
+            if (! $candidate) {
+                continue;
+            }
+
+            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
+                return $settings[$candidate];
+            }
+
+            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
+                return $config[$candidate];
+            }
+        }
+
+        return $this->{$key === 'brand_id' ? 'brandId' : 'secretKey'} ?? $default;
     }
 }

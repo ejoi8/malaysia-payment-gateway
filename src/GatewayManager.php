@@ -22,7 +22,7 @@ class GatewayManager
 {
     protected array $drivers = [];
 
-    protected array $customDrivers = [];
+    protected array $driverResolvers = [];
 
     /**
      * Get a gateway driver instance.
@@ -115,7 +115,8 @@ class GatewayManager
      */
     public function extend(string $name, callable $callback): static
     {
-        $this->customDrivers[$name] = $callback;
+        $this->driverResolvers[$name] = $callback;
+        unset($this->drivers[$name]);
 
         return $this;
     }
@@ -125,7 +126,7 @@ class GatewayManager
      */
     public function getAvailableDrivers(): array
     {
-        return array_keys($this->customDrivers);
+        return array_keys($this->driverResolvers);
     }
 
     /**
@@ -141,8 +142,8 @@ class GatewayManager
      */
     protected function resolve(string $name): GatewayInterface
     {
-        if (isset($this->customDrivers[$name])) {
-            return call_user_func($this->customDrivers[$name], app());
+        if (isset($this->driverResolvers[$name])) {
+            return call_user_func($this->driverResolvers[$name], app());
         }
 
         throw new InvalidArgumentException("Payment gateway [{$name}] is not supported.");

@@ -31,27 +31,30 @@ class PayPalGatewayTest extends TestCase
 
     public function test_it_uses_sandbox_url_when_enabled(): void
     {
-        $gateway = new PayPalGateway(sandbox: true);
+        $gateway = new class(null, null, true) extends PayPalGateway
+        {
+            public function apiUrl(): string
+            {
+                return $this->getApiUrl();
+            }
+        };
 
-        // Use reflection to test protected method
-        $reflection = new \ReflectionClass($gateway);
-        $method = $reflection->getMethod('getApiUrl');
-        $method->setAccessible(true);
-
-        $url = $method->invoke($gateway);
+        $url = $gateway->apiUrl();
 
         $this->assertStringContainsString('sandbox', $url);
     }
 
     public function test_it_uses_production_url_when_sandbox_disabled(): void
     {
-        $gateway = new PayPalGateway(sandbox: false);
+        $gateway = new class(null, null, false) extends PayPalGateway
+        {
+            public function apiUrl(): string
+            {
+                return $this->getApiUrl();
+            }
+        };
 
-        $reflection = new \ReflectionClass($gateway);
-        $method = $reflection->getMethod('getApiUrl');
-        $method->setAccessible(true);
-
-        $url = $method->invoke($gateway);
+        $url = $gateway->apiUrl();
 
         $this->assertStringNotContainsString('sandbox', $url);
         $this->assertStringContainsString('api-m.paypal.com', $url);

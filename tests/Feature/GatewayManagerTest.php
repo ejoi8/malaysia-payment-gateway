@@ -131,4 +131,14 @@ class GatewayManagerTest extends TestCase
 
         $this->assertEquals('toyyibpay', $manager->getDefaultDriver());
     }
+
+    public function test_it_skips_disabled_gateways(): void
+    {
+        config(['payment-gateway.gateways.paypal.enabled' => false]);
+
+        $manager = app(GatewayManager::class);
+        $drivers = $manager->getAvailableDrivers();
+
+        $this->assertNotContains('paypal', $drivers);
+    }
 }

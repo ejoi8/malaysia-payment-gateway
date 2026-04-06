@@ -8,6 +8,7 @@ use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
 use Ejoi8\MalaysiaPaymentGateway\Mail\PaymentFailedMail;
 use Ejoi8\MalaysiaPaymentGateway\Mail\PaymentInitiatedMail;
 use Ejoi8\MalaysiaPaymentGateway\Mail\PaymentSucceededMail;
+use Illuminate\Contracts\Mail\Mailable;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 
@@ -27,41 +28,38 @@ class SendPaymentNotification
      */
     public function handle($event): void
     {
-        Log::info('SendPaymentNotification: Handler started for event '.get_class($event));
-
         $config = config('payment-gateway.notifications');
 
         if (empty($config['enabled'])) {
-            Log::info('SendPaymentNotification: Notifications disabled in config.');
-
             return;
         }
 
         $payable = $event->payable;
         $customer = $payable->getPaymentCustomer();
         $email = $customer['email'] ?? null;
-
-        Log::info('SendPaymentNotification: Processing for email: '.($email ?? 'NULL'));
+        $reference = $payable->getPaymentReference();
 
         if (! $email) {
-            Log::warning('SendPaymentNotification: No email address found, skipping notification.');
+            Log::warning('Payment notification skipped: missing customer email.', [
+                'event' => class_basename($event),
+                'reference' => $reference,
+            ]);
 
             return;
         }
 
-        // Determine send method: queue or sync
         $useQueue = $config['queue'] ?? false;
 
         if ($event instanceof PaymentSucceeded && ! empty($config['email_success'])) {
-            $this->sendMail($email, new PaymentSucceededMail($payable), 'Success', $useQueue);
+            $this->sendMail($email, new PaymentSucceededMail($payable), 'success', $useQueue, $reference);
         }
 
         if ($event instanceof PaymentFailed && ! empty($config['email_failure'])) {
-            $this->sendMail($email, new PaymentFailedMail($payable), 'Failure', $useQueue);
+            $this->sendMail($email, new PaymentFailedMail($payable), 'failure', $useQueue, $reference);
         }
 
         if ($event instanceof PaymentInitiated && ! empty($config['email_initiated'])) {
-            $this->sendMail($email, new PaymentInitiatedMail($payable), 'Initiated', $useQueue);
+            $this->sendMail($email, new PaymentInitiatedMail($payable), 'initiated', $useQueue, $reference);
         }
     }
 
@@ -73,32 +71,24 @@ class SendPaymentNotification
      *
      * @param  string  $email  Recipient email address
      * @param  \Illuminate\Contracts\Mail\Mailable  $mailable  The mailable to send
-     * @param  string  $type  Type of email for logging (Success, Failure, Initiated)
+     * @param  string  $type  Type of email for logging
      * @param  bool  $useQueue  Whether to queue the email or send synchronously
      */
-    protected function sendMail(string $email, $mailable, string $type, bool $useQueue): void
+    protected function sendMail(string $email, Mailable $mailable, string $type, bool $useQueue, string $reference): void
     {
         try {
-            Log::info("SendPaymentNotification: Sending {$type} Email...");
-
             if ($useQueue) {
-                // Queue for background processing (non-blocking, with automatic retries)
                 Mail::to($email)->queue($mailable);
-                Log::info("SendPaymentNotification: {$type} Email queued successfully.");
             } else {
-                // Send immediately (blocking, but works without queue worker)
                 Mail::to($email)->send($mailable);
-                Log::info("SendPaymentNotification: {$type} Email Sent.");
             }
         } catch (\Throwable $e) {
-            // Log the error but don't break the payment flow
-            Log::error("SendPaymentNotification: Failed to send {$type} Email", [
-                'email' => $email,
+            Log::error('Payment notification failed.', [
+                'type' => $type,
+                'reference' => $reference,
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
             ]);
 
-            // Optionally report to error tracking service (Sentry, Bugsnag, etc.)
             if (app()->bound('sentry')) {
                 app('sentry')->captureException($e);
             }

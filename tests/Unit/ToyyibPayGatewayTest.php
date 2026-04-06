@@ -82,7 +82,7 @@ class ToyyibPayGatewayTest extends TestCase
 
         $gateway = new ToyyibPayGateway();
         $payable = new MockPayable(
-            settings: ['payment_item_max' => 1],
+            settings: ['max_items' => 1],
             items: [
                 ['name' => 'Item 1', 'quantity' => 1, 'price' => 2000],
                 ['name' => 'Item 2', 'quantity' => 1, 'price' => 3000],

@@ -19,6 +19,7 @@ enum PaymentStatus: string
     // Pending statuses
     case PENDING = 'pending';
     case CREATED = 'created';
+    case PENDING_VERIFICATION = 'pending_verification';
 
     // Failed statuses
     case FAILED = 'failed';
@@ -50,6 +51,7 @@ enum PaymentStatus: string
         return [
             self::PENDING->value,
             self::CREATED->value,
+            self::PENDING_VERIFICATION->value,
         ];
     }
 
@@ -70,7 +72,7 @@ enum PaymentStatus: string
      */
     public static function isSuccess(string $status): bool
     {
-        return in_array($status, self::successStatuses());
+        return in_array($status, self::successStatuses(), true);
     }
 
     /**
@@ -78,7 +80,7 @@ enum PaymentStatus: string
      */
     public static function isPending(string $status): bool
     {
-        return in_array($status, self::pendingStatuses());
+        return in_array($status, self::pendingStatuses(), true);
     }
 
     /**
@@ -86,7 +88,7 @@ enum PaymentStatus: string
      */
     public static function isFailed(string $status): bool
     {
-        return in_array($status, self::failedStatuses());
+        return in_array($status, self::failedStatuses(), true);
     }
 
     /**
@@ -102,6 +104,7 @@ enum PaymentStatus: string
 
             self::PENDING->value,
             self::CREATED->value => 'Payment is pending. Waiting for confirmation.',
+            self::PENDING_VERIFICATION->value => 'Payment is pending manual verification.',
 
             self::FAILED->value => 'Payment was not successful. Please try again.',
             self::CANCELLED->value => 'Payment was cancelled.',

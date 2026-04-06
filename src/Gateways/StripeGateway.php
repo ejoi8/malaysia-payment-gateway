@@ -6,6 +6,7 @@ use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Stripe payment gateway.
@@ -42,7 +43,7 @@ class StripeGateway implements GatewayInterface
     public function initiate(PayableInterface $payable): array
     {
         $settings = $payable->getPaymentSettings();
-        $secretKey = $this->secretKey ?? $settings['stripe_secret_key'] ?? '';
+        $secretKey = $this->secretKey($settings);
 
         $payload = $this->buildCheckoutPayload($payable);
 
@@ -117,7 +118,7 @@ class StripeGateway implements GatewayInterface
     protected function verifyBySessionId(PayableInterface $payable, string $sessionId): array
     {
         $settings = $payable->getPaymentSettings();
-        $secretKey = $this->secretKey ?? $settings['stripe_secret_key'] ?? '';
+        $secretKey = $this->secretKey($settings);
 
         // Call Stripe API to retrieve session details
         $response = Http::withBasicAuth($secretKey, '')
@@ -230,8 +231,7 @@ class StripeGateway implements GatewayInterface
 
     public function refund(string $transactionId, ?int $amount = null): array
     {
-        $settings = config('payment-gateway.gateways.stripe', []);
-        $secretKey = $this->secretKey ?? $settings['secret_key'] ?? '';
+        $secretKey = $this->secretKey();
 
         $payload = ['payment_intent' => $transactionId];
         if ($amount !== null) {
@@ -292,18 +292,18 @@ class StripeGateway implements GatewayInterface
 
     public function verifySignature(\Illuminate\Http\Request $request): bool
     {
-        $webhookSecret = config('payment-gateway.gateways.stripe.webhook_secret');
+        $webhookSecret = $this->webhookSecret();
 
         // Skip verification if no secret configured (development only)
         if (empty($webhookSecret)) {
-            \Log::warning('Stripe webhook signature verification skipped - no secret configured');
+            Log::warning('Stripe webhook signature verification skipped - no secret configured');
 
             return true;
         }
 
         $signature = $request->header('Stripe-Signature');
         if (! $signature) {
-            \Log::error('Stripe webhook: Missing Stripe-Signature header');
+            Log::error('Stripe webhook: Missing Stripe-Signature header');
 
             return false;
         }
@@ -329,7 +329,7 @@ class StripeGateway implements GatewayInterface
             }
 
             if (! $timestamp || empty($signatures)) {
-                \Log::error('Stripe webhook: Invalid signature format');
+                Log::error('Stripe webhook: Invalid signature format');
 
                 return false;
             }
@@ -337,7 +337,7 @@ class StripeGateway implements GatewayInterface
             // Verify timestamp is recent (within 5 minutes)
             $currentTime = time();
             if (abs($currentTime - $timestamp) > 300) {
-                \Log::error('Stripe webhook: Timestamp too old or too far in future');
+                Log::error('Stripe webhook: Timestamp too old or too far in future');
 
                 return false;
             }
@@ -353,12 +353,12 @@ class StripeGateway implements GatewayInterface
                 }
             }
 
-            \Log::error('Stripe webhook: Signature verification failed');
+            Log::error('Stripe webhook: Signature verification failed');
 
             return false;
 
         } catch (\Exception $e) {
-            \Log::error('Stripe webhook signature verification error: '.$e->getMessage());
+            Log::error('Stripe webhook signature verification error: '.$e->getMessage());
 
             return false;
         }
@@ -368,8 +368,7 @@ class StripeGateway implements GatewayInterface
     {
         // Mode 1: Return URL callback (session_id in query string)
         if ($request->has('session_id') && ! $request->has('type')) {
-            $settings = config('payment-gateway.gateways.stripe', []);
-            $secretKey = $this->secretKey ?? $settings['secret_key'] ?? '';
+            $secretKey = $this->secretKey();
 
             $response = Http::withBasicAuth($secretKey, '')
                 ->get($this->getApiUrl().'/checkout/sessions/'.$request->input('session_id'));
@@ -405,5 +404,36 @@ class StripeGateway implements GatewayInterface
             'status' => 'pending',
             'message' => 'Status check implemented (Stub for Stripe).',
         ];
+    }
+
+    protected function secretKey(array $settings = []): string
+    {
+        return (string) $this->setting($settings, 'secret_key', 'stripe_secret_key', $this->secretKey ?? '');
+    }
+
+    protected function webhookSecret(): string
+    {
+        return (string) $this->setting([], 'webhook_secret', 'stripe_webhook_secret', '');
+    }
+
+    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
+    {
+        $config = config('payment-gateway.gateways.stripe', []);
+
+        foreach ([$key, $legacyKey] as $candidate) {
+            if (! $candidate) {
+                continue;
+            }
+
+            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
+                return $settings[$candidate];
+            }
+
+            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
+                return $config[$candidate];
+            }
+        }
+
+        return $default;
     }
 }

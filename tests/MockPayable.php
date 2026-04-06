@@ -26,8 +26,8 @@ class MockPayable implements PayableInterface
         ];
         
         $this->settings = $settings ?: [
-            'payment_item_max' => 10,
-            'chip_brand_id' => 'test-brand',
+            'max_items' => 10,
+            'brand_id' => 'test-brand',
         ];
         
         $this->urls = $urls ?: [
