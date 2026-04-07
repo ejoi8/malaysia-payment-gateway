@@ -702,7 +702,9 @@ vendor/bin/phpunit
 ## Requirements
 
 - PHP 8.2+
-- Laravel 10.x, 11.x, or 12.x
+- Laravel 10.x, 11.x, 12.x, or 13.x
+
+> Laravel 13 itself requires PHP 8.3+, even though this package still supports PHP 8.2 for Laravel 10-12 installs.
 
 ---
 
