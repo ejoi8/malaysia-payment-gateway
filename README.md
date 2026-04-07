@@ -13,7 +13,7 @@ A Laravel package for payment gateway integrations. Supports Malaysian gateways 
 ✅ **Custom Payable Models** - Use the built-in `Payment` model or your own model
 ✅ **Developer Sandbox** - Test gateways without writing code
 
-> **Current state:** this package is still installed as a local Composer path repository. It is not published on Packagist yet. Live `checkStatus()` polling is still stubbed for CHIP, ToyyibPay, Stripe, and PayPal, and webhook signature verification still needs production hardening for CHIP, ToyyibPay, and PayPal. Stripe signature verification works when `STRIPE_WEBHOOK_SECRET` is configured.
+> **Current state:** this package is published on Packagist as `ejoi8/malaysia-payment-gateway`, with source hosted at `https://github.com/ejoi8/malaysia-payment-gateway`. Live `checkStatus()` polling is still stubbed for CHIP, ToyyibPay, Stripe, and PayPal, and webhook signature verification still needs production hardening for CHIP, ToyyibPay, and PayPal. Stripe signature verification works when `STRIPE_WEBHOOK_SECRET` is configured.
 
 ---
 
@@ -21,26 +21,15 @@ A Laravel package for payment gateway integrations. Supports Malaysian gateways 
 
 ### 1. Installation
 
-Until this package is published to Packagist, install it from a local path repository:
-
-```json
-{
-  "repositories": [
-    {
-      "type": "path",
-      "url": "./packages/malaysia-payment-gateway"
-    }
-  ],
-  "require": {
-    "ejoi8/malaysia-payment-gateway": "*"
-  }
-}
-```
-
 ```bash
-composer update ejoi8/malaysia-payment-gateway
+composer require ejoi8/malaysia-payment-gateway
 php artisan migrate
 ```
+
+Package links:
+
+- Packagist: `https://packagist.org/packages/ejoi8/malaysia-payment-gateway`
+- GitHub: `https://github.com/ejoi8/malaysia-payment-gateway`
 
 ### 2. Configure `.env`
 
