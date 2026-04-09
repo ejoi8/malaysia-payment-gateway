@@ -136,6 +136,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Callback Handling
+    |--------------------------------------------------------------------------
+    |
+    | Controls how incoming gateway callbacks are processed.
+    | Stale callbacks can be acknowledged but ignored to avoid applying
+    | late gateway updates long after the payment should have expired.
+    |
+    */
+
+    'callbacks' => [
+        'max_age_minutes' => env('PAYMENT_CALLBACK_MAX_AGE_MINUTES', 10),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Status Check Portal (Customer Facing)
     |--------------------------------------------------------------------------
     |

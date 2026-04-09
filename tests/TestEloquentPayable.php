@@ -7,6 +7,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class TestEloquentPayable extends Model implements PayableInterface
 {
+    protected static array $records = [];
+
     protected $table = 'test_payables';
 
     protected $guarded = [];
@@ -17,6 +19,18 @@ class TestEloquentPayable extends Model implements PayableInterface
     ];
 
     public bool $wasSaved = false;
+
+    public static function register(self $payable): self
+    {
+        static::$records[$payable->getPaymentReference()] = $payable;
+
+        return $payable;
+    }
+
+    public static function resetRegistry(): void
+    {
+        static::$records = [];
+    }
 
     public function getPaymentReference(): string
     {
@@ -60,7 +74,7 @@ class TestEloquentPayable extends Model implements PayableInterface
 
     public static function findByReference(string $reference): ?self
     {
-        return null;
+        return static::$records[$reference] ?? null;
     }
 
     public function save(array $options = []): bool

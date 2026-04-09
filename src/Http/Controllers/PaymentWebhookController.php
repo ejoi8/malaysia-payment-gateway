@@ -6,8 +6,10 @@ use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\GatewayManager;
 use Ejoi8\MalaysiaPaymentGateway\Http\Controllers\Concerns\ResolvesPayables;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -67,6 +69,19 @@ class PaymentWebhookController extends Controller
                 return $this->successResponse($request, $payable, 'Payment successful');
             }
 
+            if ($this->shouldIgnoreStaleCallback($request, $payable)) {
+                $message = 'Callback ignored because it arrived after the allowed processing window.';
+
+                Log::warning('Ignoring stale payment callback', [
+                    'driver' => $driver,
+                    'reference' => $reference,
+                    'max_age_minutes' => $this->callbackMaxAgeMinutes(),
+                    'created_at' => $this->resolvePayableCreatedAt($payable)?->toIso8601String(),
+                ]);
+
+                return $this->ignoredResponse($request, $payable, $message);
+            }
+
             if ($request->isMethod('GET') && ! $gateway->getType()->requiresGetVerification()) {
                 Log::info("GET return for {$gateway->getType()->value}-based gateway {$driver}, redirecting to status page");
 
@@ -121,6 +136,22 @@ class PaymentWebhookController extends Controller
     }
 
     /**
+     * Return ignored response based on request type.
+     */
+    protected function ignoredResponse(Request $request, PayableInterface $payable, string $message)
+    {
+        if ($request->isMethod('GET')) {
+            return $this->redirectToStatus($payable)->with('warning', $message);
+        }
+
+        return response()->json([
+            'success' => true,
+            'ignored' => true,
+            'message' => $message,
+        ]);
+    }
+
+    /**
      * Return error response based on request type.
      *
      * For GET requests (return URLs): redirect with error
@@ -143,5 +174,60 @@ class PaymentWebhookController extends Controller
 
         // JSON response for webhooks
         return response()->json(['message' => $message], $status);
+    }
+
+    protected function shouldIgnoreStaleCallback(Request $request, PayableInterface $payable): bool
+    {
+        if (! $request->isMethod('POST')) {
+            return false;
+        }
+
+        $maxAgeMinutes = $this->callbackMaxAgeMinutes();
+
+        if ($maxAgeMinutes <= 0) {
+            return false;
+        }
+
+        $createdAt = $this->resolvePayableCreatedAt($payable);
+
+        if (! $createdAt) {
+            return false;
+        }
+
+        return now()->greaterThan($createdAt->copy()->addMinutes($maxAgeMinutes));
+    }
+
+    protected function callbackMaxAgeMinutes(): int
+    {
+        return max(0, (int) config('payment-gateway.callbacks.max_age_minutes', 10));
+    }
+
+    protected function resolvePayableCreatedAt(PayableInterface $payable): ?Carbon
+    {
+        $createdAt = null;
+
+        if ($payable instanceof Model) {
+            $createdAt = $payable->getAttribute($payable->getCreatedAtColumn());
+        } elseif (property_exists($payable, 'created_at')) {
+            $createdAt = $payable->created_at;
+        }
+
+        if ($createdAt instanceof Carbon) {
+            return $createdAt;
+        }
+
+        if ($createdAt instanceof \DateTimeInterface) {
+            return Carbon::instance($createdAt);
+        }
+
+        if (is_string($createdAt) && $createdAt !== '') {
+            try {
+                return Carbon::parse($createdAt);
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        return null;
     }
 }
