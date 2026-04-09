@@ -33,7 +33,10 @@ class ChipGatewayTest extends TestCase
     public function test_it_initiates_payment_with_correct_structure(): void
     {
         Http::fake([
-            '*' => Http::response(['checkout_url' => 'https://gate.chip-in.asia/checkout/12345'], 200),
+            '*' => Http::response([
+                'id' => 'chip_txn_123',
+                'checkout_url' => 'https://gate.chip-in.asia/checkout/12345',
+            ], 200),
         ]);
 
         $gateway = new ChipGateway(brandId: 'test-brand', sandbox: true);
@@ -44,6 +47,8 @@ class ChipGatewayTest extends TestCase
         $this->assertEquals('redirect', $result['type']);
         $this->assertArrayHasKey('url', $result);
         $this->assertArrayHasKey('payload', $result);
+        $this->assertArrayHasKey('response', $result);
+        $this->assertSame('chip_txn_123', $result['transaction_id']);
     }
 
     public function test_it_builds_payload_with_customer_info(): void

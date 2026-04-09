@@ -47,9 +47,14 @@ class ToyyibPayGateway implements GatewayInterface
         $response = Http::asForm()->post($this->getApiUrl().'index.php/api/createBill', $payload);
 
         if ($response->failed()) {
+            $responseData = $response->json() ?: ['body' => $response->body()];
+
             return [
                 'type' => 'error',
                 'error' => 'ToyyibPay API Error: '.$response->body(),
+                'payload' => $payload,
+                'response' => $responseData,
+                'transaction_id' => null,
             ];
         }
 
@@ -63,6 +68,9 @@ class ToyyibPayGateway implements GatewayInterface
             return [
                 'type' => 'error',
                 'error' => 'ToyyibPay did not return a BillCode: '.$response->body(),
+                'payload' => $payload,
+                'response' => $data ?: ['body' => $response->body()],
+                'transaction_id' => null,
             ];
         }
 
@@ -71,6 +79,7 @@ class ToyyibPayGateway implements GatewayInterface
             'url' => $this->getCheckoutUrl($billCode),
             'payload' => $payload,
             'response' => $data,
+            'transaction_id' => $billCode,
         ];
     }
 

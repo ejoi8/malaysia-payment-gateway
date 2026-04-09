@@ -30,10 +30,16 @@ interface GatewayInterface
      * Initiate a payment for the given payable entity.
      *
      * @param  PayableInterface  $payable  The entity being paid for
-     * @return array Response with type and data:
-     *               - ['type' => 'redirect', 'url' => '...'] for redirect-based
-     *               - ['type' => 'client_secret', 'secret' => '...'] for Stripe Elements
-     *               - ['type' => 'instructions', 'message' => '...'] for manual proof
+     * @return array Response with normalized initiation data:
+     *               - 'type' (required)
+     *               - 'payload' (required)
+     *               - 'transaction_id' (required, nullable on errors)
+     *               - 'url' (for redirect-based gateways)
+     *               - 'response' (when a raw provider response exists)
+     *
+     *               Gateways may include legacy/provider-specific keys such as
+     *               'session_id', 'order_id', or top-level manual instruction fields
+     *               for backward compatibility.
      */
     public function initiate(PayableInterface $payable): array;
 

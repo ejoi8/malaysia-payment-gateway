@@ -45,6 +45,8 @@ class ManualProofGatewayTest extends TestCase
         $this->assertEquals('instructions', $result['type']);
         $this->assertStringContainsString('1234567890', $result['message']);
         $this->assertStringContainsString('Maybank', $result['bank_info']);
+        $this->assertArrayHasKey('payload', $result);
+        $this->assertSame('manual-test-order-123', $result['transaction_id']);
     }
 
     public function test_it_includes_payment_details_in_instructions(): void
@@ -61,6 +63,8 @@ class ManualProofGatewayTest extends TestCase
         $this->assertEquals('booking-789', $result['reference']);
         $this->assertEquals(10000, $result['amount']);
         $this->assertEquals('MYR', $result['currency']);
+        $this->assertEquals('booking-789', $result['payload']['reference']);
+        $this->assertEquals('manual-booking-789', $result['transaction_id']);
     }
 
     public function test_it_uses_default_message_when_not_configured(): void

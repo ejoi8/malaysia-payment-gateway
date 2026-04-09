@@ -38,9 +38,7 @@ class ManualProofGateway implements GatewayInterface
     public function initiate(PayableInterface $payable): array
     {
         $settings = $payable->getPaymentSettings();
-
-        return [
-            'type' => 'instructions',
+        $payload = [
             'message' => $settings['message']
                 ?? $settings['manual_proof_message']
                 ?? $this->message
@@ -54,6 +52,17 @@ class ManualProofGateway implements GatewayInterface
             'reference' => $payable->getPaymentReference(),
             'amount' => $payable->getPaymentAmount(),
             'currency' => $payable->getPaymentCurrency(),
+        ];
+
+        return [
+            'type' => 'instructions',
+            'message' => $payload['message'],
+            'bank_info' => $payload['bank_info'],
+            'reference' => $payload['reference'],
+            'amount' => $payload['amount'],
+            'currency' => $payload['currency'],
+            'payload' => $payload,
+            'transaction_id' => 'manual-'.$payable->getPaymentReference(),
         ];
     }
 

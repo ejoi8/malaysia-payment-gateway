@@ -33,7 +33,8 @@ class EventsTest extends TestCase
         Event::assertDispatched(PaymentInitiated::class, function ($event) use ($payable) {
             return $event->payable === $payable
                 && $event->gateway === 'chip'
-                && is_array($event->response);
+                && is_array($event->response)
+                && ($event->response['transaction_id'] ?? null) === 'txn_mock_123';
         });
     }
 
@@ -77,13 +78,19 @@ class EventsTest extends TestCase
     public function test_payment_initiated_event_has_correct_properties(): void
     {
         $payable = new MockPayable(reference: 'order-xyz');
-        $response = ['type' => 'redirect', 'url' => 'https://example.com'];
+        $response = [
+            'type' => 'redirect',
+            'url' => 'https://example.com',
+            'payload' => ['reference' => 'order-xyz'],
+            'transaction_id' => 'txn-order-xyz',
+        ];
 
         $event = new PaymentInitiated($payable, 'chip', $response);
 
         $this->assertSame($payable, $event->payable);
         $this->assertEquals('chip', $event->gateway);
         $this->assertEquals($response, $event->response);
+        $this->assertSame('txn-order-xyz', $event->response['transaction_id']);
     }
 
     public function test_payment_succeeded_event_has_correct_properties(): void

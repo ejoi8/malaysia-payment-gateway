@@ -195,6 +195,36 @@ POST /payment/webhook/stripe  → Verify via webhook payload
 GET  /payment/webhook/stripe  → Verify via session_id API call
 ```
 
+### Normalized `initiate()` Response
+
+All built-in gateways now return a normalized initiation payload so application code and listeners can read the same key for the gateway-side initiation identifier.
+
+- `type` is always present
+- `payload` is always present
+- `transaction_id` is always present on successful initiation and `null` on initiation errors
+- `url` is present for redirect-based gateways
+- `response` is present when the gateway returned a raw API response
+
+Gateway-specific compatibility keys are still preserved where they already existed, such as Stripe `session_id`, PayPal `order_id`, and Manual Proof top-level instruction fields.
+
+```php
+[
+    'type' => 'redirect',
+    'url' => 'https://...',
+    'payload' => [...],
+    'response' => [...], // when available
+    'transaction_id' => 'provider-side-initiation-id',
+]
+```
+
+Built-in mappings:
+
+- CHIP: response `id`
+- Stripe: Checkout Session `id`
+- PayPal: Order `id`
+- ToyyibPay: `BillCode`
+- Manual Proof: `manual-{reference}`
+
 ---
 
 ## Supported Gateways
@@ -618,6 +648,8 @@ if ($type->usesWebhook()) {
 When implementing a new gateway, declare its type:
 
 ```php
+use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
+use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
 
 class MyCustomGateway implements GatewayInterface
@@ -625,6 +657,26 @@ class MyCustomGateway implements GatewayInterface
     public function getType(): GatewayType
     {
         return GatewayType::WEBHOOK; // or API, MANUAL
+    }
+
+    public function initiate(PayableInterface $payable): array
+    {
+        $payload = [
+            'reference' => $payable->getPaymentReference(),
+        ];
+
+        $response = [
+            'id' => 'gw_123',
+            'checkout_url' => 'https://gateway.test/pay/gw_123',
+        ];
+
+        return [
+            'type' => 'redirect',
+            'url' => $response['checkout_url'],
+            'payload' => $payload,
+            'response' => $response,
+            'transaction_id' => $response['id'],
+        ];
     }
 
     // ... other methods
@@ -685,6 +737,14 @@ Events: PAYMENT.CAPTURE.COMPLETED
 The package also supports GET return verification using PayPal's `token` / `orderID` query parameters.
 
 Current caveat: PayPal webhook signature verification is still stubbed. The GET return flow is currently the more complete path.
+
+### `PaymentInitiated` Follow-Up Improvement
+
+The normalized `transaction_id` is now available in every built-in `PaymentInitiated::$response` payload.
+
+A follow-up improvement is still worth adding as a separate change: an opt-in listener that persists this initiation-time `transaction_id` onto Eloquent payables, or onto models exposing `applyPaymentGatewayUpdate(array $attributes)`.
+
+Keeping that as a separate feature is cleaner because initiation-time persistence is a new side effect, while this release only normalizes the response contract.
 
 ---
 
