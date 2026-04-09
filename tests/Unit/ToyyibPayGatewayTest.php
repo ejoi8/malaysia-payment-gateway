@@ -44,6 +44,8 @@ class ToyyibPayGatewayTest extends TestCase
         $this->assertEquals('redirect', $result['type']);
         $this->assertArrayHasKey('url', $result);
         $this->assertArrayHasKey('payload', $result);
+        $this->assertArrayHasKey('response', $result);
+        $this->assertSame('BILL001', $result['transaction_id']);
     }
 
     public function test_it_builds_payload_with_bill_info(): void

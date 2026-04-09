@@ -46,16 +46,17 @@ class PayPalGateway implements GatewayInterface
 
     public function initiate(PayableInterface $payable): array
     {
+        $payload = $this->buildOrderPayload($payable);
         $accessToken = $this->getAccessToken($payable);
 
         if (! $accessToken) {
             return [
                 'type' => 'error',
                 'error' => 'Failed to authenticate with PayPal',
+                'payload' => $payload,
+                'transaction_id' => null,
             ];
         }
-
-        $payload = $this->buildOrderPayload($payable);
 
         $response = Http::withToken($accessToken)
             ->post($this->getApiUrl().'/v2/checkout/orders', $payload);
@@ -68,15 +69,22 @@ class PayPalGateway implements GatewayInterface
             return [
                 'type' => 'redirect',
                 'url' => $approveLink['href'] ?? '',
-                'order_id' => $order['id'],
+                'order_id' => $order['id'] ?? null,
                 'payload' => $payload,
+                'response' => $order,
+                'transaction_id' => $order['id'] ?? null,
             ];
         }
 
+        $responseData = $response->json() ?: ['body' => $response->body()];
+
         return [
             'type' => 'error',
-            'error' => $response->json()['message'] ?? 'Failed to create PayPal order',
-            'details' => $response->json(),
+            'error' => $responseData['message'] ?? 'Failed to create PayPal order',
+            'details' => $responseData,
+            'payload' => $payload,
+            'response' => $responseData,
+            'transaction_id' => null,
         ];
     }
 

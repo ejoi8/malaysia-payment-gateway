@@ -49,9 +49,14 @@ class ChipGateway implements GatewayInterface
             ->post($this->getApiUrl().'/purchases/', $payload);
 
         if ($response->failed()) {
+            $responseData = $response->json() ?: ['body' => $response->body()];
+
             return [
                 'type' => 'error',
                 'error' => 'CHIP API Error: '.$response->body(),
+                'payload' => $payload,
+                'response' => $responseData,
+                'transaction_id' => null,
             ];
         }
 
@@ -62,6 +67,7 @@ class ChipGateway implements GatewayInterface
             'url' => $data['checkout_url'] ?? $this->getCheckoutUrl($data['id'] ?? $payable->getPaymentReference()),
             'payload' => $payload,
             'response' => $data,
+            'transaction_id' => $data['id'] ?? null,
         ];
     }
 

@@ -60,12 +60,19 @@ class StripeGateway implements GatewayInterface
                 'url' => $session['url'],
                 'session_id' => $session['id'],
                 'payload' => $payload,
+                'response' => $session,
+                'transaction_id' => $session['id'] ?? null,
             ];
         }
 
+        $responseData = $response->json() ?: ['body' => $response->body()];
+
         return [
             'type' => 'error',
-            'error' => $response->json()['error']['message'] ?? 'Failed to create checkout session',
+            'error' => $responseData['error']['message'] ?? 'Failed to create checkout session',
+            'payload' => $payload,
+            'response' => $responseData,
+            'transaction_id' => null,
         ];
     }
 
