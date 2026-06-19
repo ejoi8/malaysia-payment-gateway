@@ -13,7 +13,7 @@ A Laravel package for payment gateway integrations. Supports Malaysian gateways 
 ✅ **Custom Payable Models** - Use the built-in `Payment` model or your own model
 ✅ **Developer Sandbox** - Test gateways without writing code
 
-> **Current state:** this package is published on Packagist as `ejoi8/malaysia-payment-gateway`, with source hosted at `https://github.com/ejoi8/malaysia-payment-gateway`. Live `checkStatus()` polling is still stubbed for CHIP, ToyyibPay, Stripe, and PayPal, and webhook signature verification still needs production hardening for CHIP, ToyyibPay, and PayPal. Stripe signature verification works when `STRIPE_WEBHOOK_SECRET` is configured.
+> **Current state:** this package is published on Packagist as `ejoi8/malaysia-payment-gateway`, with source hosted at `https://github.com/ejoi8/malaysia-payment-gateway`. Webhook signature verification is implemented for all four automated gateways and is **active once you configure the relevant secret/key** (CHIP `public_key`, ToyyibPay is automatic, Stripe `webhook_secret`, PayPal `webhook_id`); when unconfigured it is skipped and logged. Live `checkStatus()` polling is implemented for all four gateways and exposed via the `payment:reconcile` command — see [Reconciliation](#reconciliation--recovering-missed-webhooks).
 
 ---
 
@@ -102,14 +102,23 @@ class CheckoutController extends Controller
         // 2. Initiate payment
         $response = $gateway->initiate('chip', $payment);
 
-        // 3. Redirect to gateway
-        if ($response['type'] === 'redirect') {
-            return redirect($response['url']);
+        // 3. Redirect to gateway (typed API; array access also works)
+        if ($response->isRedirect()) {
+            return redirect($response->redirectUrl());
         }
 
-        return back()->with('error', $response['error'] ?? 'Payment failed');
+        return back()->with('error', $response->errorMessage() ?? 'Payment failed');
     }
 }
+```
+
+Prefer the facade? It reads the same and needs no constructor injection:
+
+```php
+use Ejoi8\MalaysiaPaymentGateway\Facades\Payment;
+
+$response = Payment::initiate('chip', $payment);
+// or resolve a single driver: Payment::gateway('chip')->initiate($payment);
 ```
 
 **That's it!** The package handles everything else automatically.
@@ -118,59 +127,148 @@ class CheckoutController extends Controller
 
 ## How It Works
 
-### Payment Flow Diagram
+```mermaid
+flowchart TD
+    A["Create payable<br/>status = pending"] --> B["Payment::initiate(driver, payable)"]
+    B --> C{"PaymentResponse type"}
+    C -->|redirect| D["Redirect to gateway URL"]
+    C -->|form| E["Render auto-submit form<br/>(iPay88 / senangPay)"]
+    C -->|instructions| F["Show bank-transfer details"]
+    C -->|error| G["Show error message"]
+    D --> P["Customer pays at the gateway"]
+    E --> P
+    F --> P
+    P --> CB["Gateway calls<br/>/payment/webhook/{driver}"]
+    CB --> M{"POST or GET?"}
+    M -->|POST webhook| V["verifySignature → verify()"]
+    M -->|GET return| API{"API gateway?"}
+    API -->|Stripe / PayPal| V
+    API -->|CHIP / ToyyibPay| S["Redirect to status page"]
+    V --> OK{"Verified?"}
+    OK -->|yes| SUC(["PaymentSucceeded"])
+    OK -->|no| FAIL(["PaymentFailed"])
+    SUC --> L["Update status · receipt email · admin alert · outgoing webhook"]
+    FAIL --> L
+    L --> S
+    S --> Z["Status page<br/>or your success/failed URL"]
+```
+
+**Three gateway styles, one flow.** *Webhook* gateways (CHIP, ToyyibPay) are verified by the POST callback — the GET return just shows status. *API* gateways (Stripe, PayPal) are verified on both the POST webhook and the GET return. *Manual* (bank transfer) is approved by you. Everything after `initiate()` — verification, status updates, emails, and your outgoing webhook — runs automatically.
+
+---
+
+## Usage
+
+### 1. Create the payment
+
+```php
+use Ejoi8\MalaysiaPaymentGateway\Models\Payment;
+
+$payment = Payment::create([
+    'gateway' => 'chip',
+    'reference' => 'ORD-'.uniqid(),
+    'amount' => 5000,            // cents → RM 50.00
+    'currency' => 'MYR',
+    'description' => 'Court Booking',
+    'customer_name' => 'Ali',
+    'customer_email' => 'ali@example.com',
+    'items' => [['name' => 'Badminton Court', 'quantity' => 1, 'price' => 5000]],
+]);
+```
+
+`Payment` is the built-in model; plug in [your own model](#using-your-own-model) just as easily.
+
+### 2. Initiate and hand off to the gateway
+
+`initiate()` returns a `PaymentResponse`. Branch on its type — every gateway style is covered:
+
+```php
+use Ejoi8\MalaysiaPaymentGateway\Facades\Payment;
+
+$r = Payment::initiate($payment->gateway, $payment);
+
+return match (true) {
+    $r->isRedirect()     => redirect($r->redirectUrl()),                 // CHIP, ToyyibPay, Stripe, PayPal
+    $r->isFormPost()     => view('payment-gateway::auto-submit', [       // iPay88, senangPay
+        'action' => $r->formAction(),
+        'fields' => $r->formFields(),
+    ]),
+    $r->isInstructions() => view('checkout.manual', ['details' => $r]),  // bank transfer
+    default              => back()->with('error', $r->errorMessage()),   // initiation failed
+};
+```
+
+Array access still works (`$r['url']`, `$r['session_id']`) if you prefer.
+
+### 3. The callback — handled for you
+
+One route, `/payment/webhook/{driver}`, accepts both the server-to-server **POST** webhook and the customer **GET** return. It verifies the signature, verifies the payment, updates the record, and fires events. **You write nothing here** — just point each gateway's callback/return URL at it (see [Webhook Setup](#webhook-setup)).
+
+### 4. React to the outcome (optional)
+
+Hook your domain logic onto the events:
+
+```php
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
+
+Event::listen(PaymentSucceeded::class, function (PaymentSucceeded $e) {
+    Booking::where('reference', $e->payable->getPaymentReference())->update(['confirmed' => true]);
+});
+```
+
+Built in already: customer receipt email, optional admin alert, and an optional signed [outgoing webhook](#notifications) to your own backend.
+
+### 5. Where the customer lands after paying
+
+By default, once the package verifies the payment on the customer's return, it
+sends them to the **built-in status page** — a styled card showing PAID / FAILED
+/ PENDING (publishable via `vendor:publish --tag=payment-gateway-views`):
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         PAYMENT FLOW                                 │
-└─────────────────────────────────────────────────────────────────────┘
+/payment/status/{reference}   # styled status page (default)
+/payment/check-status         # "track my payment" search portal
+```
 
-1. INITIATE PAYMENT
-   ┌──────────┐    ┌─────────────┐    ┌──────────────┐
-   │   Your   │───▶│  Gateway    │───▶│   Payment    │
-   │   App    │    │   Manager   │    │   Gateway    │
-   └──────────┘    └─────────────┘    └──────────────┘
-                          │                   │
-                          ▼                   ▼
-                   PaymentInitiated    User redirected
-                   Event fired         to gateway
+**Prefer your own pages?** Set redirect URLs — applied *after* verification, so
+Stripe/PayPal still get verified first:
 
-2. USER PAYS
-   ┌──────────┐    ┌──────────────┐
-   │   User   │───▶│   Gateway    │
-   │          │    │   (Stripe,   │
-   │          │◀───│   CHIP, etc) │
-   └──────────┘    └──────────────┘
+```php
+// config/payment-gateway.php
+'redirects' => [
+    'success' => env('PAYMENT_SUCCESS_URL', '/checkout/thank-you'),
+    'failed'  => env('PAYMENT_FAILED_URL',  '/checkout/failed'),
+],
+```
 
-3. CALLBACK (Unified Route)
-   ┌──────────────┐    ┌─────────────────────┐
-   │   Gateway    │───▶│  /payment/webhook/  │
-   │   Callback   │    │      {driver}       │
-   └──────────────┘    └─────────────────────┘
-          │                      │
-          │         ┌────────────┴────────────┐
-          │         │                         │
-          ▼         ▼                         ▼
-       [POST]    [GET for               [GET for
-       Webhook   Stripe/PayPal]         CHIP/ToyyibPay]
-          │           │                       │
-          │           │                       │
-          ▼           ▼                       ▼
-       Verify     Verify via API        Just redirect
-       payload    (session_id/token)    (POST already verified)
-          │           │                       │
-          └───────────┴───────────────────────┘
-                          │
-                          ▼
-                   Update payment status
-                   Fire events
-                   Send notifications
-                          │
-                          ▼
-               ┌─────────────────────┐
-               │   Status Page       │
-               │ /payment/status/REF │
-               └─────────────────────┘
+```
+pay → https://yourapp.com/checkout/thank-you?reference=ORD-1024
+```
+
+- The reference is appended as `?reference=…`, or substituted into a
+  `{reference}` placeholder (`/booking/{reference}/confirmed`).
+- **Per-payment override** (different flows in one app) — set it when creating
+  the payment; it wins over the global config:
+
+  ```php
+  Payment::create([
+      // ...
+      'metadata' => ['urls' => [
+          'success_redirect' => route('booking.confirmed', $booking),
+          'failed_redirect'  => route('booking.retry', $booking),
+      ]],
+  ]);
+  ```
+- Unset → falls back to the built-in status page. On your page, look up the
+  **real** status server-side via the reference (never trust a query param).
+
+### 6. Refund (Stripe, PayPal, CHIP)
+
+```php
+$result = Payment::refund('stripe', $payment->transaction_id, 5000); // omit amount = full refund
+
+if ($result->success) {
+    // payable is automatically marked 'refunded'
+}
 ```
 
 ---
@@ -195,29 +293,42 @@ POST /payment/webhook/stripe  → Verify via webhook payload
 GET  /payment/webhook/stripe  → Verify via session_id API call
 ```
 
-### Normalized `initiate()` Response
+### Normalized `initiate()` / `verify()` Responses
 
-All built-in gateways now return a normalized initiation payload so application code and listeners can read the same key for the gateway-side initiation identifier.
-
-- `type` is always present
-- `payload` is always present
-- `transaction_id` is always present on successful initiation and `null` on initiation errors
-- `url` is present for redirect-based gateways
-- `response` is present when the gateway returned a raw API response
-
-Gateway-specific compatibility keys are still preserved where they already existed, such as Stripe `session_id`, PayPal `order_id`, and Manual Proof top-level instruction fields.
+`initiate()` returns a `PaymentResponse` and `verify()`/`refund()` return a
+`VerificationResult`. Both are immutable value objects that expose typed
+accessors **and** implement `ArrayAccess`, so the v1 array style keeps working
+unchanged while new code gets type safety and IDE autocomplete.
 
 ```php
-[
-    'type' => 'redirect',
-    'url' => 'https://...',
-    'payload' => [...],
-    'response' => [...], // when available
-    'transaction_id' => 'provider-side-initiation-id',
-]
+$response = Payment::initiate('chip', $payment);
+
+// New, typed API
+$response->isRedirect();      // bool
+$response->redirectUrl();     // ?string
+$response->transactionId;     // ?string
+$response->errorMessage();    // ?string when it failed
+
+// Backward-compatible array access (unchanged from v1)
+$response['type'];            // 'redirect' | 'instructions' | 'error'
+$response['url'];
+$response['transaction_id'];
+$response['session_id'];      // gateway-specific extras still resolve
 ```
 
-Built-in mappings:
+`PaymentResponse` guarantees:
+
+- `type` is always present (`redirect`, `instructions` or `error`)
+- `payload` is always present (the request payload sent to the gateway)
+- `transaction_id` is present on success and `null` on initiation errors
+- `url` / `response` are present for redirect-based gateways
+- gateway-specific keys are preserved: Stripe `session_id`, PayPal `order_id`,
+  Manual Proof top-level instruction fields (`message`, `bank_info`, `amount`, …)
+
+`VerificationResult` exposes `->success`, `->transactionId`, `->error`, `->meta`
+(and the same keys via array access).
+
+Built-in `transaction_id` mappings:
 
 - CHIP: response `id`
 - Stripe: Checkout Session `id`
@@ -225,19 +336,72 @@ Built-in mappings:
 - ToyyibPay: `BillCode`
 - Manual Proof: `manual-{reference}`
 
+### Initiation response types
+
+A gateway hands off to the customer in one of several ways. `PaymentResponse`
+models each so the package can support many gateway styles, not just redirects:
+
+| `type`         | Builder (`AbstractGateway`)            | Used by | Front-end handling |
+| -------------- | -------------------------------------- | ------- | ------------------ |
+| `redirect`     | `$this->redirect($url, …)`             | CHIP, ToyyibPay, Stripe, PayPal | `redirect($r->redirectUrl())` |
+| `form`         | `$this->form($action, $fields, …)`     | iPay88, senangPay (signed form POST) | `return view('payment-gateway::auto-submit', [...])` |
+| `client_token` | `$this->clientToken($token, …)`        | Midtrans Snap, Razorpay (JS SDK) | pass `$r->token()` to the front-end SDK |
+| `instructions` | `$this->instructions($fields, …)`      | Manual Proof | show bank details |
+| `error`        | `$this->fail($message, …)`             | any (initiation failed) | show `$r->errorMessage()` |
+
+The bundled `payment-gateway::auto-submit` Blade view renders a `form`-type
+response as an auto-submitting POST:
+
+```php
+$response = Payment::initiate('ipay88', $payment);
+
+if ($response->isFormPost()) {
+    return view('payment-gateway::auto-submit', [
+        'action' => $response->formAction(),
+        'fields' => $response->formFields(),
+        'method' => $response->formMethod(),
+    ]);
+}
+```
+
+> **Amounts are always in the smallest currency unit (cents).** `getPaymentAmount()`
+> and item `price` are integers (e.g. `5500` = RM 55.00). Gateways that need a
+> decimal string (PayPal) convert with `Support\Money::toDecimal()`; gateways that
+> want cents (CHIP, ToyyibPay, Stripe) send the value as-is.
+
+### How line items reach the gateway
+
+Your full itemised `items` array is stored on the payment record and shown on
+**your** pages — but the gateway is always charged a **single line at the
+payable's total `amount`**. This makes `amount` the one source of truth: Stripe
+can't recompute a different total, PayPal can't reject a mismatched breakdown,
+and there's no provider line-item limit to hit.
+
+The single line is named after `getPaymentDescription()`, with an automatic
+`(N items)` suffix when the cart holds more than one unit — so the gateway
+receipt still signals a multi-item purchase:
+
+```
+Cart: T-Shirt + Shoes + Cap   →   gateway shows:  "Order ORD-1024 (3 items)  RM200.00"
+```
+
+Tune the suffix via `gateway_line.append_count` / `gateway_line.label` (e.g.
+`(3 tickets)`), or set the count yourself in the description and turn the suffix
+off. Itemisation for the customer lives on your own checkout/receipt pages.
+
 ---
 
 ## Supported Gateways
 
-| Gateway          | Type    | Return URL | Refund | Notes |
-| ---------------- | ------- | ---------- | ------ | ----- |
-| **CHIP**         | Webhook | ✅         | Planned, not implemented yet | Callback handling built in, signature verification still stubbed |
-| **ToyyibPay**    | Webhook | ✅         | ❌ | Callback handling built in, signature verification still permissive |
-| **Stripe**       | API     | ✅         | ✅ | Webhook signature verification supported when `STRIPE_WEBHOOK_SECRET` is set |
-| **PayPal**       | API     | ✅         | ✅ | Return verification works, webhook signature verification still stubbed |
-| **Manual Proof** | Manual  | ❌         | Manual only | Status managed inside your app |
+| Gateway          | Type    | Return URL | Refund | Signature verification |
+| ---------------- | ------- | ---------- | ------ | ---------------------- |
+| **CHIP**         | Webhook | ✅         | ✅ | RSA-SHA256 — set `public_key` |
+| **ToyyibPay**    | Webhook | ✅         | ❌ (no API) | `md5` hash — automatic |
+| **Stripe**       | API     | ✅         | ✅ | HMAC-SHA256 — set `webhook_secret` |
+| **PayPal**       | API     | ✅         | ✅ | Verify API — set `webhook_id` |
+| **Manual Proof** | Manual  | ❌         | Manual only | n/a |
 
-The customer status page mainly shows the package's stored payment status. In the current implementation, gateway-side `checkStatus()` calls for CHIP, ToyyibPay, Stripe, and PayPal still return placeholder responses rather than a full live lookup.
+Each gateway's `verifySignature()` verifies the callback when its key/secret is configured, and **skips with a logged warning** when it isn't (so local development isn't blocked). Configure the secret in production. The customer status page shows the package's stored payment status, kept current by webhooks and the [reconcile command](#reconciliation--recovering-missed-webhooks).
 
 ---
 
@@ -261,6 +425,9 @@ return [
     // Your Payable model (use built-in or your own)
     'model' => \Ejoi8\MalaysiaPaymentGateway\Models\Payment::class,
 
+    // Save the gateway transaction id at initiation time (for reconciliation)
+    'persist_initiation_id' => env('PAYMENT_PERSIST_INITIATION_ID', true),
+
     // Route configuration
     'routes' => [
         'prefix' => 'payment',
@@ -270,7 +437,12 @@ return [
     // Shared package settings
     'settings' => [
         'default_currency' => env('PAYMENT_DEFAULT_CURRENCY', 'MYR'),
-        'max_items' => env('PAYMENT_MAX_ITEMS', 10),
+    ],
+
+    // The single line charged to the gateway (description + "(N items)" suffix)
+    'gateway_line' => [
+        'append_count' => env('PAYMENT_APPEND_ITEM_COUNT', true),
+        'label' => env('PAYMENT_ITEM_COUNT_LABEL', 'items'),
     ],
 
     // Status portal (customer tracking)
@@ -279,13 +451,21 @@ return [
         'path' => 'check-status',
     ],
 
-    // Email notifications
+    // Notifications (customer emails + optional admin email)
     'notifications' => [
         'enabled' => env('PAYMENT_NOTIFICATIONS_ENABLED', true),
         'queue' => env('PAYMENT_NOTIFICATIONS_QUEUE', false),
         'email_success' => true,
         'email_failure' => true,
         'email_initiated' => true,
+        'admin_email' => env('PAYMENT_ADMIN_EMAIL'), // merchant alert on success/failure
+    ],
+
+    // Signed server-to-server webhook to your own backend
+    'outgoing_webhook' => [
+        'url' => env('MERCHANT_WEBHOOK_URL'),
+        'secret' => env('MERCHANT_WEBHOOK_SECRET'),
+        'queue' => env('MERCHANT_WEBHOOK_QUEUE', false),
     ],
 
     // Developer sandbox
@@ -417,6 +597,19 @@ public function applyPaymentGatewayUpdate(array $attributes): void
 }
 ```
 
+To enable automatic **refund-status** updates, also expose a static
+`findByTransactionId()` (refunds are initiated by id, not by payable, so the
+package resolves the record by its stored transaction id):
+
+```php
+public static function findByTransactionId(string $transactionId): ?self
+{
+    return static::where('gateway_transaction_ref', $transactionId)->first();
+}
+```
+
+The built-in `Payment` model already implements both hooks.
+
 ### 3. Update Config
 
 ```php
@@ -515,6 +708,65 @@ public function boot(): void
 | `PaymentSucceeded` | After payment is verified as successful         |
 | `PaymentFailed`    | After payment is verified as failed             |
 | `PaymentRefunded`  | After a refund is processed                     |
+
+---
+
+## Notifications
+
+Verified payment events drive three independent, opt-in channels — none require
+you to write a listener.
+
+### Customer emails (built in)
+
+On `initiated` / `succeeded` / `failed`, a receipt email goes to the customer
+(`getPaymentCustomer()['email']`). Toggle each via `notifications.email_*`;
+publish `resources/views/vendor/payment-gateway/mail/*` to restyle.
+
+### Merchant/admin email
+
+Set a recipient to be alerted on **success and failure** (comma-separate for
+several):
+
+```env
+PAYMENT_ADMIN_EMAIL=owner@store.com
+```
+
+### Outgoing webhook (server-to-server)
+
+Forward `payment.succeeded` / `payment.failed` / `payment.refunded` to your own
+backend as a **signed POST** — the mirror image of how gateways notify this
+package:
+
+```env
+MERCHANT_WEBHOOK_URL=https://your-app.com/internal/payment-events
+MERCHANT_WEBHOOK_SECRET=a-long-random-string
+MERCHANT_WEBHOOK_QUEUE=false
+```
+
+Example body (`payment.succeeded`):
+
+```json
+{
+  "event": "payment.succeeded",
+  "gateway": "chip",
+  "reference": "ORD-123",
+  "amount": 5000,
+  "currency": "MYR",
+  "transaction_id": "...",
+  "meta": {}
+}
+```
+
+When a secret is set, the request carries
+`X-Payment-Signature: hmac_sha256(rawBody, secret)`. Verify it on your side:
+
+```php
+$expected = hash_hmac('sha256', $request->getContent(), config('services.payments.secret'));
+abort_unless(hash_equals($expected, (string) $request->header('X-Payment-Signature')), 403);
+```
+
+All three channels swallow delivery errors (logged, with optional Sentry
+capture) so a failed email or webhook never breaks the payment flow.
 
 ---
 
@@ -645,47 +897,100 @@ if ($type->usesWebhook()) {
 
 ### Adding a New Gateway
 
-When implementing a new gateway, declare its type:
+Extend `AbstractGateway` and implement only the parts unique to your provider:
+`getName()`, `getType()`, `initiate()`, `verify()` and `getPaymentIdFromRequest()`.
+The base class supplies everything reusable:
+
+- **Config** — `$this->setting('key', $default, $settings)` (per-payable settings → gateway config → published config → default).
+- **HTTP** — `$this->http()` returns a timeout-configured client; use it for every outbound call.
+- **Response builders** — `$this->redirect()`, `$this->form()`, `$this->clientToken()`, `$this->instructions()`, `$this->fail()` for `initiate()`; `$this->verified()` / `$this->rejected()` for `verify()`/`refund()`.
+- **Signing** — `Support\Signature` (`hmac()`, `hash()`, `rsaVerify()`, constant-time `equals()`) for `verifySignature()` and for signing outgoing requests.
+- **Money / line items** — `Support\Money::toDecimal()` (cents→decimal) and `Support\LineItems::summaryName()` (the single gateway line name).
+- **URLs** — `$this->appendReference()`.
+
+Sensible defaults are provided for the optional capability methods
+(`supportsRefunds()`, `refund()`, `verifySignature()`, `checkStatus()`) — override
+one only when your gateway supports it. A signed form-POST gateway (iPay88,
+senangPay) returns `$this->form($action, $signedFields, $txnId)`; a JS-SDK gateway
+(Midtrans, Razorpay) returns `$this->clientToken($token, $txnId, $clientConfig)`.
 
 ```php
-use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
+use Ejoi8\MalaysiaPaymentGateway\Gateways\AbstractGateway;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Illuminate\Http\Request;
 
-class MyCustomGateway implements GatewayInterface
+class MyCustomGateway extends AbstractGateway
 {
+    public function getName(): string
+    {
+        return 'mygateway';
+    }
+
     public function getType(): GatewayType
     {
         return GatewayType::WEBHOOK; // or API, MANUAL
     }
 
-    public function initiate(PayableInterface $payable): array
+    public function initiate(PayableInterface $payable): PaymentResponse
     {
-        $payload = [
-            'reference' => $payable->getPaymentReference(),
-        ];
+        $settings = $payable->getPaymentSettings();
+        $payload = ['reference' => $payable->getPaymentReference()];
 
-        $response = [
-            'id' => 'gw_123',
-            'checkout_url' => 'https://gateway.test/pay/gw_123',
-        ];
+        $response = $this->http()->withToken($this->setting('secret_key', '', $settings))
+            ->post('https://gateway.test/api/charges', $payload);
 
-        return [
-            'type' => 'redirect',
-            'url' => $response['checkout_url'],
-            'payload' => $payload,
-            'response' => $response,
-            'transaction_id' => $response['id'],
-        ];
+        if ($response->failed()) {
+            return $this->fail('Gateway error: '.$response->body(), $payload, $response->json());
+        }
+
+        $data = $response->json();
+
+        return $this->redirect(
+            url: $data['checkout_url'],
+            transactionId: $data['id'] ?? null,
+            payload: $payload,
+            response: $data,
+        );
     }
 
-    // ... other methods
+    public function verify(PayableInterface $payable, array $payload): VerificationResult
+    {
+        return ($payload['status'] ?? null) === 'paid'
+            ? $this->verified($payload['id'] ?? null, $payload)
+            : $this->rejected($payload['error'] ?? 'Payment not successful', $payload);
+    }
+
+    public function getPaymentIdFromRequest(Request $request): ?string
+    {
+        return $request->input('reference');
+    }
+
+    // Want refunds? Override these:
+    // public function supportsRefunds(): bool { return true; }
+    // public function refund(string $transactionId, ?int $amount = null): VerificationResult { ... }
 }
 ```
+
+Register it in `config/payment-gateway.php` under `gateways` with a
+`driver_class` key (and any credentials), and it's resolvable by name —
+`Payment::gateway('mygateway')`. For runtime/tenant-specific instances you can
+also register a closure with `$manager->extend('mygateway', fn () => MyCustomGateway::make([...]))`.
 
 ---
 
 ## Webhook Setup
+
+All gateways POST to the single endpoint `/payment/webhook/{driver}`. The
+controller verifies the signature, serializes concurrent callbacks for the same
+payment (per-reference lock), and acknowledges with **HTTP 200** once the outcome
+is recorded — **including failed payments** (`{ "success": false }`). This is
+deliberate: returning a 4xx for a *recorded* failure would make the gateway retry
+the callback (duplicate failure emails, and some gateways disable endpoints that
+keep erroring). Non-2xx is reserved for cases the package genuinely couldn't
+handle — bad signature (`403`), unknown reference (`404`), server error (`500`).
 
 ### CHIP
 
@@ -695,7 +1000,7 @@ In your CHIP dashboard, set the callback URL to:
 https://your-domain.com/payment/webhook/chip
 ```
 
-Current caveat: callback extraction works, but signature verification is still stubbed in the package.
+Signature verification: CHIP signs callbacks with RSA-SHA256 (base64 `X-Signature`). Set `CHIP_PUBLIC_KEY` (the PEM from `GET /api/v1/public_key/`) to enable verification; when unset it is skipped and logged.
 
 ### ToyyibPay
 
@@ -706,7 +1011,7 @@ When creating bills, the package automatically sets:
 
 ToyyibPay callbacks/returns are identified from payload fields such as `order_id`, `billcode`, or `refno`.
 
-Current caveat: ToyyibPay callback verification is still permissive because the package does not yet implement stronger authenticity checks.
+Signature verification: the package verifies the callback `hash` automatically — `md5(userSecretKey + status + order_id + refno + "ok")`. No extra configuration is needed (the GET return carries no hash, so it is not signature-checked).
 
 ### Stripe
 
@@ -721,7 +1026,7 @@ Events: checkout.session.completed, payment_intent.succeeded
 
 The package also supports GET return verification using the `session_id` Stripe appends to the success URL.
 
-For webhook signature verification, set `STRIPE_WEBHOOK_SECRET`.
+For webhook signature verification, set `STRIPE_WEBHOOK_SECRET` (HMAC-SHA256 over the `Stripe-Signature` header). When unset, verification is skipped and logged — set it in production.
 
 ### PayPal
 
@@ -734,17 +1039,91 @@ Webhook URL: https://your-domain.com/payment/webhook/paypal
 Events: PAYMENT.CAPTURE.COMPLETED
 ```
 
-The package also supports GET return verification using PayPal's `token` / `orderID` query parameters.
+The package also supports GET return verification using PayPal's `token` / `orderID` query parameters (the return-capture flow is the primary path).
 
-Current caveat: PayPal webhook signature verification is still stubbed. The GET return flow is currently the more complete path.
+Signature verification: set `PAYPAL_WEBHOOK_ID` to verify webhooks via PayPal's `verify-webhook-signature` API. When unset, verification is skipped and logged.
 
-### `PaymentInitiated` Follow-Up Improvement
+### Reconciliation — recovering missed webhooks
 
-The normalized `transaction_id` is now available in every built-in `PaymentInitiated::$response` payload.
+Webhooks occasionally never arrive (gateway hiccup, your server down during the
+callback). Without a safety net, that payment stays `pending` forever even
+though the money moved. The package polls the gateway for the real status:
 
-A follow-up improvement is still worth adding as a separate change: an opt-in listener that persists this initiation-time `transaction_id` onto Eloquent payables, or onto models exposing `applyPaymentGatewayUpdate(array $attributes)`.
+- **`checkStatus()`** is implemented for all four gateways (CHIP `GET /purchases/{id}/`,
+  ToyyibPay `getBillTransactions`, Stripe retrieve-session, PayPal `GET /v2/checkout/orders/{id}`),
+  using the transaction id stored at initiation.
+- **`php artisan payment:reconcile`** finds pending payments older than
+  `--minutes` (default 15), asks the gateway, and fires `PaymentSucceeded` /
+  `PaymentFailed` for any that resolved — so status updates and notifications go
+  out exactly as if the webhook had arrived. **Schedule it:**
 
-Keeping that as a separate feature is cleaner because initiation-time persistence is a new side effect, while this release only normalizes the response contract.
+  ```php
+  // routes/console.php (Laravel 11+) or app/Console/Kernel.php
+  Schedule::command('payment:reconcile')->everyFiveMinutes();
+  ```
+
+> The transaction id is resolved from the model's `transaction_id` column. For a
+> non-Eloquent payable, add an optional `getPaymentTransactionId(): ?string`
+> method to expose it.
+
+### State persistence & idempotency
+
+The package keeps your payable in sync automatically:
+
+- **On initiation** — the gateway's `transaction_id` is saved (status untouched)
+  so a pending payment can be reconciled before it's confirmed. Disable with
+  `persist_initiation_id => false`. The verified id overwrites it on success.
+- **On success / failure** — status is set to `paid` / `failed` (+ failure
+  reason in metadata).
+- **On refund** — the payable is resolved by transaction id and marked
+  `refunded` (requires `findByTransactionId()` on the model — see
+  [Using Your Own Model](#using-your-own-model)).
+- **Concurrent callbacks** — callbacks for the same payment are serialized with
+  an atomic per-reference cache lock, so two simultaneous webhooks can't both
+  process it. It degrades gracefully if your cache store has no lock support;
+  tune via `callbacks.lock*`.
+
+All write-backs go through the `applyPaymentGatewayUpdate()` hook when present,
+so custom column names keep working.
+
+---
+
+## Upgrading from v1 to v2
+
+v2 makes the gateway layer consistent without forcing a rewrite. The headline
+change: `initiate()` now returns a `PaymentResponse` object and
+`verify()`/`refund()` return a `VerificationResult` object, instead of plain
+arrays.
+
+**Most apps need no changes** — both objects implement `ArrayAccess`, so existing
+code like `$response['url']`, `$response['session_id']` or `$result['success']`
+keeps working, and Blade views are unaffected.
+
+Review your code only if you:
+
+- **Type-hint the return as `array`** (e.g. `function handle(array $response)`),
+  or call `is_array()` on it — switch to the typed object or read `->toArray()`.
+- **Construct gateways directly with positional/named args**
+  (`new ChipGateway(brandId: ...)`) — use `ChipGateway::make(['brand_id' => ...])`
+  (or just resolve through the manager/facade, which is unchanged).
+- **Implement `GatewayInterface` directly** — extend `AbstractGateway` instead and
+  return via the response builders (see [Adding a New Gateway](#adding-a-new-gateway)).
+  The interface's `initiate()`/`verify()`/`refund()` return types changed.
+- **Relied on legacy flat config keys** like `chip_secret_key` — use the nested
+  `gateways.chip.secret_key` config (the documented format) or per-payable
+  `getPaymentSettings()` overrides.
+- **Webhook signature verification is now active when configured.** ToyyibPay
+  callbacks are now hash-verified automatically; CHIP/PayPal verify once you set
+  `CHIP_PUBLIC_KEY` / `PAYPAL_WEBHOOK_ID`. Real gateway callbacks are unaffected,
+  but custom test harnesses that POST unsigned payloads to these endpoints will
+  now be rejected (configure the key, or omit it to skip verification).
+- **CHIP now reports `supportsRefunds() === true`** and implements `refund()`.
+
+New helpers you can reuse in custom gateways: `Support\Money::toDecimal()`
+(cents→decimal), `Support\LineItems::summaryName()` (the single gateway line name), and
+`Support\Signature` (HMAC / RSA / constant-time compare). New initiation
+response types — `formPost()` (signed form-POST gateways) and `clientToken()`
+(JS-SDK gateways) — let the package support gateways beyond redirect-URL ones.
 
 ---
 
@@ -754,7 +1133,7 @@ Run the package tests:
 
 ```bash
 composer install
-vendor/bin/phpunit
+vendor/bin/pest   # or: composer test
 ```
 
 ---
