@@ -59,7 +59,7 @@ class TestEloquentPayable extends Model implements PayableInterface
 
     public function getPaymentUrls(): array
     {
-        return [];
+        return $this->getAttribute('urls') ?? [];
     }
 
     public function getPaymentItems(): array
@@ -75,6 +75,17 @@ class TestEloquentPayable extends Model implements PayableInterface
     public static function findByReference(string $reference): ?self
     {
         return static::$records[$reference] ?? null;
+    }
+
+    public static function findByTransactionId(string $transactionId): ?self
+    {
+        foreach (static::$records as $record) {
+            if ((string) $record->getAttribute('transaction_id') === $transactionId) {
+                return $record;
+            }
+        }
+
+        return null;
     }
 
     public function save(array $options = []): bool

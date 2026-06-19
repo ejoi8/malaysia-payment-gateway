@@ -5,6 +5,7 @@ namespace Ejoi8\MalaysiaPaymentGateway\Tests\Unit;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentRefunded;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
 use Ejoi8\MalaysiaPaymentGateway\Listeners\UpdatePaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\Tests\TestCase;
@@ -94,5 +95,43 @@ class UpdatePaymentStatusTest extends TestCase
             'status' => PaymentStatus::defaultFailedStatus(),
             'metadata' => ['failure_reason' => 'Declined'],
         ]], $payable->updates);
+    }
+
+    public function test_it_marks_payable_refunded_by_transaction_id(): void
+    {
+        TestEloquentPayable::resetRegistry();
+        config(['payment-gateway.model' => TestEloquentPayable::class]);
+
+        $payable = TestEloquentPayable::register(new TestEloquentPayable([
+            'reference' => 'ref-refund',
+            'transaction_id' => 'txn-refund-1',
+            'status' => PaymentStatus::defaultSuccessStatus(),
+            'amount' => 2500,
+            'currency' => 'MYR',
+            'description' => 'Refundable',
+        ]));
+
+        $listener = new UpdatePaymentStatus;
+        $listener->handle(new PaymentRefunded('txn-refund-1', 'chip', 2500, ['refund_id' => 'r1']));
+
+        $this->assertTrue($payable->wasSaved);
+        $this->assertSame(PaymentStatus::REFUNDED->value, $payable->status);
+
+        TestEloquentPayable::resetRegistry();
+    }
+
+    public function test_refund_is_a_noop_when_transaction_id_is_unknown(): void
+    {
+        TestEloquentPayable::resetRegistry();
+        config(['payment-gateway.model' => TestEloquentPayable::class]);
+
+        $listener = new UpdatePaymentStatus;
+
+        // No matching payable registered — must not throw.
+        $listener->handle(new PaymentRefunded('txn-missing', 'chip', 1000));
+
+        $this->assertNull(TestEloquentPayable::findByTransactionId('txn-missing'));
+
+        TestEloquentPayable::resetRegistry();
     }
 }

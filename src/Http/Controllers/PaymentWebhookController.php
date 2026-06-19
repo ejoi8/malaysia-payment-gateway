@@ -2,14 +2,18 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Http\Controllers;
 
+use Closure;
+use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\GatewayManager;
 use Ejoi8\MalaysiaPaymentGateway\Http\Controllers\Concerns\ResolvesPayables;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -48,61 +52,105 @@ class PaymentWebhookController extends Controller
                 return $this->errorResponse($request, 'Payment reference not found in payload', 400);
             }
 
-            try {
-                $payable = $this->findPayable($reference);
-            } catch (RuntimeException $e) {
-                Log::error('Callback error: '.$e->getMessage());
-
-                return $this->errorResponse($request, 'Server Configuration Error', 500);
-            }
-
-            if (! $payable) {
-                Log::error("Callback error: Payment record not found for reference {$reference}");
-
-                return $this->errorResponse($request, 'Payment record not found', 404);
-            }
-
-            $currentStatus = $payable->status ?? PaymentStatus::UNKNOWN->value;
-            if (PaymentStatus::isSuccess($currentStatus)) {
-                Log::info("Payment {$reference} is already processed (Status: {$currentStatus})");
-
-                return $this->successResponse($request, $payable, 'Payment successful');
-            }
-
-            if ($this->shouldIgnoreStaleCallback($request, $payable)) {
-                $message = 'Callback ignored because it arrived after the allowed processing window.';
-
-                Log::warning('Ignoring stale payment callback', [
-                    'driver' => $driver,
-                    'reference' => $reference,
-                    'max_age_minutes' => $this->callbackMaxAgeMinutes(),
-                    'created_at' => $this->resolvePayableCreatedAt($payable)?->toIso8601String(),
-                ]);
-
-                return $this->ignoredResponse($request, $payable, $message);
-            }
-
-            if ($request->isMethod('GET') && ! $gateway->getType()->requiresGetVerification()) {
-                Log::info("GET return for {$gateway->getType()->value}-based gateway {$driver}, redirecting to status page");
-
-                return $this->redirectToStatus($payable);
-            }
-
-            $payload = $request->all();
-            $result = $manager->verify($driver, $payable, $payload);
-
-            Log::info("Callback processed for {$reference}: ".($result['success'] ? 'Success' : 'Failed'));
-
-            if ($result['success']) {
-                return $this->successResponse($request, $payable, 'Payment successful');
-            }
-
-            return $this->errorResponse($request, $result['error'] ?? 'Payment verification failed', 400);
+            // Serialize concurrent callbacks for the same payment so two
+            // simultaneous webhooks can't both verify-and-process it.
+            return $this->withCallbackLock(
+                $reference,
+                fn () => $this->process($request, $driver, $reference, $manager, $gateway),
+            );
 
         } catch (\Exception $e) {
             Log::error('Callback exception: '.$e->getMessage());
 
             return $this->errorResponse($request, 'Server Error', 500);
+        }
+    }
+
+    /**
+     * Resolve the payable and process the callback.
+     *
+     * Runs inside the per-reference lock and re-reads the payment's current
+     * state, so a duplicate callback that waited on the lock sees the
+     * already-processed status and short-circuits.
+     */
+    protected function process(Request $request, string $driver, string $reference, GatewayManager $manager, GatewayInterface $gateway)
+    {
+        try {
+            $payable = $this->findPayable($reference);
+        } catch (RuntimeException $e) {
+            Log::error('Callback error: '.$e->getMessage());
+
+            return $this->errorResponse($request, 'Server Configuration Error', 500);
+        }
+
+        if (! $payable) {
+            Log::error("Callback error: Payment record not found for reference {$reference}");
+
+            return $this->errorResponse($request, 'Payment record not found', 404);
+        }
+
+        $currentStatus = $payable->status ?? PaymentStatus::UNKNOWN->value;
+        if (PaymentStatus::isSuccess($currentStatus)) {
+            Log::info("Payment {$reference} is already processed (Status: {$currentStatus})");
+
+            return $this->successResponse($request, $payable, 'Payment successful');
+        }
+
+        if ($this->shouldIgnoreStaleCallback($request, $payable)) {
+            $message = 'Callback ignored because it arrived after the allowed processing window.';
+
+            Log::warning('Ignoring stale payment callback', [
+                'driver' => $driver,
+                'reference' => $reference,
+                'max_age_minutes' => $this->callbackMaxAgeMinutes(),
+                'created_at' => $this->resolvePayableCreatedAt($payable)?->toIso8601String(),
+            ]);
+
+            return $this->ignoredResponse($request, $payable, $message);
+        }
+
+        if ($request->isMethod('GET') && ! $gateway->getType()->requiresGetVerification()) {
+            Log::info("GET return for {$gateway->getType()->value}-based gateway {$driver}, redirecting to status page");
+
+            return $this->redirectToStatus($payable);
+        }
+
+        $result = $manager->verify($driver, $payable, $request->all());
+
+        Log::info("Callback processed for {$reference}: ".($result['success'] ? 'Success' : 'Failed'));
+
+        if ($result['success']) {
+            return $this->successResponse($request, $payable, 'Payment successful');
+        }
+
+        return $this->failureResponse($request, $payable, $result['error'] ?? 'Payment verification failed');
+    }
+
+    /**
+     * Run $callback while holding an atomic per-reference lock so concurrent
+     * callbacks for the same payment are serialized. Degrades gracefully when
+     * the cache store has no lock support or the lock can't be acquired in time.
+     */
+    protected function withCallbackLock(string $reference, Closure $callback)
+    {
+        if (! config('payment-gateway.callbacks.lock', true)) {
+            return $callback();
+        }
+
+        try {
+            return Cache::lock('mpg-callback:'.$reference, (int) config('payment-gateway.callbacks.lock_seconds', 10))
+                ->block((int) config('payment-gateway.callbacks.lock_wait', 5), $callback);
+        } catch (LockTimeoutException $e) {
+            Log::warning('Payment callback lock contention; processing without lock', ['reference' => $reference]);
+
+            return $callback();
+        } catch (\Throwable $e) {
+            Log::debug('Payment callback locking unavailable; processing without lock', [
+                'reference' => $reference,
+                'error' => $e->getMessage(),
+            ]);
+
+            return $callback();
         }
     }
 
@@ -125,14 +173,62 @@ class PaymentWebhookController extends Controller
     protected function successResponse(Request $request, PayableInterface $payable, string $message)
     {
         if ($request->isMethod('GET')) {
-            // Redirect user to payment status page
-            $statusUrl = route('payment-gateway.status', ['reference' => $payable->getPaymentReference()]);
-
-            return redirect($statusUrl)->with('success', $message);
+            return redirect($this->resolveRedirect($payable, 'success'));
         }
 
         // JSON response for webhooks
         return response()->json(['success' => true, 'message' => $message]);
+    }
+
+    /**
+     * Return a failed-payment response.
+     *
+     * For GET returns: redirect to the configured failed URL (or the status page).
+     * For POST webhooks: acknowledge with HTTP 200 (the failure has been recorded)
+     * so the gateway stops retrying — a non-2xx would trigger retries, duplicate
+     * failure notifications, and can get the endpoint disabled by the gateway.
+     * The body reports the failed outcome for anyone inspecting the response.
+     */
+    protected function failureResponse(Request $request, PayableInterface $payable, string $message)
+    {
+        if ($request->isMethod('GET')) {
+            return redirect($this->resolveRedirect($payable, 'failed'));
+        }
+
+        return response()->json(['success' => false, 'message' => $message]);
+    }
+
+    /**
+     * Resolve where to send the customer after payment.
+     *
+     * Precedence: per-payment override (metadata.urls.{type}_redirect) →
+     * global config (redirects.{type}) → the built-in status page.
+     *
+     * @param  string  $type  'success' or 'failed'
+     */
+    protected function resolveRedirect(PayableInterface $payable, string $type): string
+    {
+        $custom = $payable->getPaymentUrls()["{$type}_redirect"] ?? null;
+        $custom = $custom ?: config("payment-gateway.redirects.{$type}");
+
+        if ($custom) {
+            return $this->withReference((string) $custom, $payable->getPaymentReference());
+        }
+
+        return route('payment-gateway.status', ['reference' => $payable->getPaymentReference()]);
+    }
+
+    /**
+     * Add the payment reference to a redirect URL — substituting a {reference}
+     * placeholder if present, otherwise appending it as a query parameter.
+     */
+    protected function withReference(string $url, string $reference): string
+    {
+        if (str_contains($url, '{reference}')) {
+            return str_replace('{reference}', rawurlencode($reference), $url);
+        }
+
+        return $url.(str_contains($url, '?') ? '&' : '?').'reference='.rawurlencode($reference);
     }
 
     /**

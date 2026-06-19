@@ -83,4 +83,34 @@ class PaymentWebhookControllerTest extends TestCase
         $this->assertSame('txn-fresh-123', $payable->transaction_id);
         $this->assertTrue($payable->wasSaved);
     }
+
+    public function test_it_is_idempotent_for_duplicate_callbacks(): void
+    {
+        TestEloquentPayable::register(new TestEloquentPayable([
+            'reference' => 'dup-ref-123',
+            'status' => PaymentStatus::defaultPendingStatus(),
+            'gateway' => 'chip',
+            'amount' => 1000,
+            'currency' => 'MYR',
+            'description' => 'Duplicate callback payment',
+            'created_at' => Carbon::now()->subMinutes(1),
+        ]));
+
+        $payload = [
+            'reference' => 'dup-ref-123',
+            'status' => 'paid',
+            'transaction_id' => 'txn-dup-123',
+        ];
+
+        $first = $this->postJson(route('payment-gateway.webhook', ['driver' => 'chip']), $payload);
+        $second = $this->postJson(route('payment-gateway.webhook', ['driver' => 'chip']), $payload);
+
+        $first->assertOk()->assertJson(['success' => true]);
+        // The duplicate sees the already-processed status and short-circuits.
+        $second->assertOk()->assertJson(['success' => true]);
+
+        $payable = TestEloquentPayable::findByReference('dup-ref-123');
+        $this->assertSame(PaymentStatus::defaultSuccessStatus(), $payable->status);
+        $this->assertSame('txn-dup-123', $payable->transaction_id);
+    }
 }
