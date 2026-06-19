@@ -47,7 +47,7 @@ class PayPalGatewayTest extends TestCase
             ], 200),
         ]);
 
-        $gateway = new PayPalGateway(sandbox: true);
+        $gateway = PayPalGateway::make(['sandbox' => true]);
         $payable = new MockPayable;
 
         $result = $gateway->initiate($payable);
@@ -62,7 +62,7 @@ class PayPalGatewayTest extends TestCase
 
     public function test_it_uses_sandbox_url_when_enabled(): void
     {
-        $gateway = new class(null, null, true) extends PayPalGateway
+        $gateway = new class(['sandbox' => true]) extends PayPalGateway
         {
             public function apiUrl(): string
             {
@@ -77,7 +77,7 @@ class PayPalGatewayTest extends TestCase
 
     public function test_it_uses_production_url_when_sandbox_disabled(): void
     {
-        $gateway = new class(null, null, false) extends PayPalGateway
+        $gateway = new class(['sandbox' => false]) extends PayPalGateway
         {
             public function apiUrl(): string
             {
@@ -89,6 +89,30 @@ class PayPalGatewayTest extends TestCase
 
         $this->assertStringNotContainsString('sandbox', $url);
         $this->assertStringContainsString('api-m.paypal.com', $url);
+    }
+
+    public function test_it_sends_only_the_total_without_line_items(): void
+    {
+        Http::fake([
+            'https://api-m.sandbox.paypal.com/v1/oauth2/token' => Http::response(['access_token' => 'tok'], 200),
+            'https://api-m.sandbox.paypal.com/v2/checkout/orders' => Http::response([
+                'id' => 'ORDER-1',
+                'links' => [['rel' => 'approve', 'href' => 'https://approve']],
+            ], 200),
+        ]);
+
+        $gateway = PayPalGateway::make(['sandbox' => true]);
+        // Items would sum to RM100, but the real charge is RM90.
+        $payable = new MockPayable(amount: 9000, description: 'Order', items: [
+            ['name' => 'Shirt', 'quantity' => 1, 'price' => 5000],
+            ['name' => 'Pants', 'quantity' => 1, 'price' => 5000],
+        ]);
+
+        $unit = $gateway->initiate($payable)['payload']['purchase_units'][0];
+
+        $this->assertSame('90.00', $unit['amount']['value']);
+        $this->assertArrayNotHasKey('items', $unit);
+        $this->assertArrayNotHasKey('breakdown', $unit['amount']);
     }
 
     public function test_verify_fails_without_order_id(): void

@@ -2,33 +2,25 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Gateways;
 
-use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
-use Illuminate\Support\Facades\Http;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Ejoi8\MalaysiaPaymentGateway\Support\LineItems;
+use Ejoi8\MalaysiaPaymentGateway\Support\Signature;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 /**
  * CHIP payment gateway (Malaysian FPX provider).
  *
+ * Amounts are sent in cents (the package convention), which matches CHIP's API.
+ *
  * @see https://docs.chip-in.asia/
  */
-class ChipGateway implements GatewayInterface
+class ChipGateway extends AbstractGateway
 {
-    public function __construct(
-        protected ?string $brandId = null,
-        protected ?string $secretKey = null,
-        protected bool $sandbox = false
-    ) {}
-
-    public static function make(array $config): self
-    {
-        return new self(
-            brandId: $config['brand_id'] ?? null,
-            secretKey: $config['secret_key'] ?? null,
-            sandbox: $config['sandbox'] ?? false
-        );
-    }
-
     public function getName(): string
     {
         return 'chip';
@@ -39,128 +31,165 @@ class ChipGateway implements GatewayInterface
         return GatewayType::WEBHOOK;
     }
 
-    public function initiate(PayableInterface $payable): array
-    {
-        $settings = $payable->getPaymentSettings();
-        $payload = $this->buildPayload($payable);
-        $secretKey = $this->setting($settings, 'secret_key', 'chip_secret_key', '');
-
-        $response = Http::withToken($secretKey)
-            ->post($this->getApiUrl().'/purchases/', $payload);
-
-        if ($response->failed()) {
-            $responseData = $response->json() ?: ['body' => $response->body()];
-
-            return [
-                'type' => 'error',
-                'error' => 'CHIP API Error: '.$response->body(),
-                'payload' => $payload,
-                'response' => $responseData,
-                'transaction_id' => null,
-            ];
-        }
-
-        $data = $response->json();
-
-        return [
-            'type' => 'redirect',
-            'url' => $data['checkout_url'] ?? $this->getCheckoutUrl($data['id'] ?? $payable->getPaymentReference()),
-            'payload' => $payload,
-            'response' => $data,
-            'transaction_id' => $data['id'] ?? null,
-        ];
-    }
-
-    /**
-     * Verify payment status from webhook callback.
-     *
-     * This method is called by the PaymentWebhookController when a webhook
-     * is received from CHIP. It examines the webhook payload to determine
-     * if the payment was successful.
-     *
-     * CHIP webhook payload contains:
-     * - status: 'paid' or 'success' for successful payments
-     * - transaction_id or id: The transaction identifier
-     * - reference: The payment reference
-     *
-     * @param  PayableInterface  $payable  The payment record being verified
-     * @param  array  $payload  The raw webhook payload from CHIP
-     * @return array Returns ['success' => bool, 'transaction_id' => string|null, 'meta' => array]
-     *               - If successful: triggers PaymentSucceeded event
-     *               - If failed: triggers PaymentFailed event
-     */
-    public function verify(PayableInterface $payable, array $payload): array
-    {
-        $status = $payload['status'] ?? null;
-
-        if ($status === 'paid' || $status === 'success') {
-            return [
-                'success' => true,
-                'transaction_id' => $payload['transaction_id'] ?? $payload['id'] ?? null,
-                'meta' => $payload,
-            ];
-        }
-
-        // Identify error message from common CHIP failure fields
-        $error = $payload['failed_reason']
-            ?? $payload['status_description']
-            ?? $payload['error']
-            ?? $payload['reason'] // For compatibility with some sandbox simulations
-            ?? 'Payment not successful ('.($status ?? 'unknown status').')';
-
-        return [
-            'success' => false,
-            'error' => $error,
-            'meta' => $payload,
-        ];
-    }
-
-    public function supportsWebhooks(): bool
+    public function supportsRefunds(): bool
     {
         return true;
     }
 
-    public function supportsRefunds(): bool
+    public function initiate(PayableInterface $payable): PaymentResponse
     {
-        return false;
+        $settings = $payable->getPaymentSettings();
+        $payload = $this->buildPayload($payable);
+        $secretKey = (string) $this->setting('secret_key', '', $settings);
+
+        $response = $this->http()->withToken($secretKey)
+            ->post($this->getApiUrl().'/purchases/', $payload);
+
+        if ($response->failed()) {
+            return $this->fail(
+                'CHIP API Error: '.$response->body(),
+                $payload,
+                $response->json() ?: ['body' => $response->body()],
+            );
+        }
+
+        $data = $response->json();
+        $checkoutUrl = $data['checkout_url'] ?? null;
+
+        if (! $checkoutUrl) {
+            return $this->fail('CHIP did not return a checkout URL', $payload, $data ?: []);
+        }
+
+        return $this->redirect(
+            url: $checkoutUrl,
+            transactionId: $data['id'] ?? null,
+            payload: $payload,
+            response: $data,
+        );
     }
 
-    public function refund(string $transactionId, ?int $amount = null): array
+    /**
+     * Verify payment status from a CHIP webhook/return payload.
+     *
+     * CHIP marks a payment paid with status 'paid'; the purchase id is the
+     * top-level 'id'. Failures carry a reason in one of several fields.
+     */
+    public function verify(PayableInterface $payable, array $payload): VerificationResult
     {
-        // Implement CHIP refund API
-        return [
-            'success' => false,
-            'error' => 'Refund not implemented yet',
-        ];
+        $status = $payload['status'] ?? null;
+
+        if ($status === 'paid' || $status === 'success') {
+            // Real CHIP webhooks carry the purchase id in `id`; `transaction_id`
+            // is kept as a fallback for callers/simulations that send it.
+            return $this->verified($payload['transaction_id'] ?? $payload['id'] ?? null, $payload);
+        }
+
+        $error = $payload['failed_reason']
+            ?? $payload['status_description']
+            ?? $payload['error']
+            ?? $payload['reason']
+            ?? 'Payment not successful ('.($status ?? 'unknown status').')';
+
+        return $this->rejected($error, $payload);
     }
 
+    public function refund(string $transactionId, ?int $amount = null): VerificationResult
+    {
+        $secretKey = (string) $this->setting('secret_key', '');
+        $payload = $amount !== null ? ['amount' => $amount] : [];
+
+        $response = $this->http()->withToken($secretKey)
+            ->post($this->getApiUrl()."/purchases/{$transactionId}/refund/", $payload);
+
+        if ($response->successful()) {
+            $data = $response->json();
+
+            return $this->verified($data['id'] ?? $transactionId, $data);
+        }
+
+        $body = $response->json() ?: [];
+
+        return $this->rejected(
+            $body['__all__'][0]['message'] ?? $body['message'] ?? 'Refund failed',
+            $body,
+        );
+    }
+
+    /**
+     * Verify the CHIP webhook signature.
+     *
+     * CHIP signs the raw body with RSA-SHA256 and sends the base64-encoded
+     * signature in the X-Signature header. Configure the PEM public key
+     * (config: gateways.chip.public_key, fetched once from GET /public_key/).
+     * When no key is configured, verification is skipped and logged.
+     */
+    public function verifySignature(Request $request): bool
+    {
+        $publicKey = (string) $this->setting('public_key', '');
+
+        if ($publicKey === '') {
+            Log::warning('CHIP webhook signature verification skipped - no public_key configured');
+
+            return true;
+        }
+
+        $signature = $request->header('X-Signature');
+
+        if (! $signature) {
+            Log::error('CHIP webhook: missing X-Signature header');
+
+            return false;
+        }
+
+        return Signature::rsaVerify($request->getContent(), base64_decode($signature), $publicKey);
+    }
+
+    public function getPaymentIdFromRequest(Request $request): ?string
+    {
+        // POST webhook: reference is in the body.
+        // GET return: reference is in query params (appended during initiation).
+        return $request->input('reference') ?? $request->query('reference') ?? $request->input('id');
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function checkStatus(PayableInterface $payable): array
+    {
+        $id = $this->transactionId($payable);
+
+        if (! $id) {
+            return $this->statusResult(PaymentStatus::PENDING, 'No CHIP purchase id stored yet.');
+        }
+
+        $secretKey = (string) $this->setting('secret_key', '', $payable->getPaymentSettings());
+        $response = $this->http()->withToken($secretKey)->get($this->getApiUrl()."/purchases/{$id}/");
+
+        if ($response->failed()) {
+            return $this->statusResult(PaymentStatus::PENDING, 'Could not retrieve status from CHIP.', $id);
+        }
+
+        $status = $response->json()['status'] ?? null;
+
+        return match ($status) {
+            'paid' => $this->statusResult(PaymentStatus::PAID, 'Payment confirmed by CHIP.', $id),
+            'refunded' => $this->statusResult(PaymentStatus::REFUNDED, 'Payment refunded.', $id),
+            'cancelled', 'expired', 'error' => $this->statusResult(PaymentStatus::FAILED, 'Payment '.$status.'.', $id),
+            default => $this->statusResult(PaymentStatus::PENDING, 'Payment still pending ('.($status ?? 'unknown').').', $id),
+        };
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     protected function buildPayload(PayableInterface $payable): array
     {
         $settings = $payable->getPaymentSettings();
         $customer = $payable->getPaymentCustomer();
         $urls = $payable->getPaymentUrls();
-        $items = $payable->getPaymentItems();
-
-        $products = array_map(fn ($item) => [
-            'name' => $item['name'],
-            'quantity' => $item['quantity'] ?? 1,
-            'price' => $item['price'],
-        ], $items);
-
-        // Aggregate if too many items
-        $maxItems = (int) ($settings['max_items']
-            ?? $settings['payment_item_max']
-            ?? config('payment-gateway.settings.max_items', 10));
-        if (count($products) > $maxItems) {
-            $products = [[
-                'name' => 'Payment ('.count($items).' items)',
-                'quantity' => 1,
-                'price' => $payable->getPaymentAmount(),
-            ]];
-        }
 
         return [
-            'brand_id' => $this->setting($settings, 'brand_id', 'chip_brand_id', ''),
+            'brand_id' => $this->setting('brand_id', '', $settings),
             'client' => [
                 'email' => $customer['email'] ?? '',
                 'phone' => $customer['phone'] ?? '',
@@ -168,111 +197,26 @@ class ChipGateway implements GatewayInterface
             ],
             'purchase' => [
                 'currency' => $payable->getPaymentCurrency(),
-                'products' => $products,
+                // Single line at the authoritative total; total_override guarantees the charge.
+                'products' => [[
+                    'name' => LineItems::summaryName($payable),
+                    'quantity' => 1,
+                    'price' => $payable->getPaymentAmount(),
+                ]],
                 'total_override' => $payable->getPaymentAmount(),
+                // CHIP expects `language` inside the purchase object (ISO 639-1).
+                'language' => $settings['language'] ?? $settings['chip_language'] ?? 'en',
             ],
-            // Append reference to return URLs so GET returns can identify the payment
-            'success_redirect' => $this->appendReferenceToUrl($urls['return_url'] ?? '', $payable->getPaymentReference()),
-            'failure_redirect' => $this->appendReferenceToUrl($urls['cancel_url'] ?? $urls['return_url'] ?? '', $payable->getPaymentReference()),
+            'success_redirect' => $this->appendReference($urls['return_url'] ?? '', $payable->getPaymentReference()),
+            'failure_redirect' => $this->appendReference($urls['cancel_url'] ?? $urls['return_url'] ?? '', $payable->getPaymentReference()),
             'success_callback' => $urls['callback_url'] ?? '',
             'reference' => $payable->getPaymentReference(),
-            'language' => $settings['language'] ?? $settings['chip_language'] ?? 'en',
         ];
-    }
-
-    /**
-     * Append reference query parameter to URL.
-     */
-    protected function appendReferenceToUrl(string $url, string $reference): string
-    {
-        if (empty($url)) {
-            return $url;
-        }
-
-        $separator = str_contains($url, '?') ? '&' : '?';
-
-        return $url.$separator.'reference='.$reference;
     }
 
     protected function getApiUrl(): string
     {
-        // Unified API URL for both Sandbox and Live
+        // Unified API URL for both Sandbox and Live (sandbox is selected by key).
         return 'https://gate.chip-in.asia/api/v1';
-    }
-
-    protected function getCheckoutUrl(string $reference): string
-    {
-        // Fallback or constructed URL if API response doesn't provide one
-        // Note: The API usually returns 'checkout_url'
-        $baseUrl = $this->sandbox
-            ? 'https://gate.chip-in.asia/checkout' // Assuming checkout is also unified or handled by API URL
-            : 'https://gate.chip-in.asia/checkout';
-
-        return $baseUrl.'/'.$reference;
-    }
-
-    public function verifySignature(\Illuminate\Http\Request $request): bool
-    {
-        // For CHIP, we verify the X-Signature header against the payload content + secret key
-        // Implementation depends on CHIP's specific signature algorithm (e.g., HMAC-SHA256)
-        // For now, we stub it to true or basic check if possible.
-        // If a real check is needed, you would do:
-        // $signature = $request->header('X-Signature');
-        // $computed = hash_hmac('sha256', $request->getContent() . $this->brandId, $this->secretKey);
-        // return hash_equals($computed, $signature);
-
-        return true;
-    }
-
-    public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
-    {
-        // POST webhook: reference is in the body
-        // GET return: reference is in query params (appended by us during initiation)
-        return $request->input('reference') ?? $request->query('reference') ?? $request->input('id');
-    }
-
-    public function checkStatus(PayableInterface $payable): array
-    {
-        // If we have a stored transaction ID, use it. Otherwise, assume we don't know.
-        // Some gateways allow checking by Reference ID too.
-
-        // Let's assume we can query by the reference we sent
-        $ref = $payable->getPaymentReference();
-
-        // CHIP API Get Purchase: GET /purchases/{purchase_id}/
-        // We might need to store the purchase_id (transaction_id) first.
-
-        // If implementation is tricky without purchase_id, we can return pending/unknown
-        // But for "Out of Box" solution, we want this to work.
-
-        // For now, let's call the API if we can (hypothetically)
-        // $response = Http::withToken($this->secretKey)->get($this->getApiUrl() . "/purchases/" . $ref);
-
-        // Returning a simulated response for now to pass the interface check
-        return [
-            'status' => 'pending', // or 'paid'
-            'message' => 'Status check implemented but requires Transaction ID storage logic enhancement.',
-        ];
-    }
-
-    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
-    {
-        $config = config('payment-gateway.gateways.chip', []);
-
-        foreach ([$key, $legacyKey] as $candidate) {
-            if (! $candidate) {
-                continue;
-            }
-
-            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
-                return $settings[$candidate];
-            }
-
-            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
-                return $config[$candidate];
-            }
-        }
-
-        return $this->{$key === 'brand_id' ? 'brandId' : 'secretKey'} ?? $default;
     }
 }

@@ -2,6 +2,8 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Tests\Feature;
 
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Exceptions\PaymentAlreadyProcessedException;
 use Ejoi8\MalaysiaPaymentGateway\GatewayManager;
 use Ejoi8\MalaysiaPaymentGateway\Gateways\ChipGateway;
 use Ejoi8\MalaysiaPaymentGateway\Gateways\ManualProofGateway;
@@ -9,6 +11,8 @@ use Ejoi8\MalaysiaPaymentGateway\Gateways\PayPalGateway;
 use Ejoi8\MalaysiaPaymentGateway\Gateways\StripeGateway;
 use Ejoi8\MalaysiaPaymentGateway\Gateways\ToyyibPayGateway;
 use Ejoi8\MalaysiaPaymentGateway\Tests\TestCase;
+use Ejoi8\MalaysiaPaymentGateway\Tests\TestEloquentPayable;
+use Illuminate\Support\Facades\Http;
 use InvalidArgumentException;
 
 class GatewayManagerTest extends TestCase
@@ -140,5 +144,68 @@ class GatewayManagerTest extends TestCase
         $drivers = $manager->getAvailableDrivers();
 
         $this->assertNotContains('paypal', $drivers);
+    }
+
+    public function test_it_refuses_to_initiate_an_already_paid_payment(): void
+    {
+        $this->expectException(PaymentAlreadyProcessedException::class);
+
+        $manager = app(GatewayManager::class);
+        $payable = new TestEloquentPayable([
+            'reference' => 'paid-1',
+            'status' => PaymentStatus::defaultSuccessStatus(),
+            'gateway' => 'chip',
+            'amount' => 1000,
+            'currency' => 'MYR',
+            'description' => 'Already paid',
+        ]);
+
+        $manager->initiate('chip', $payable);
+    }
+
+    public function test_it_allows_initiating_a_pending_payment(): void
+    {
+        Http::fake([
+            'gate.chip-in.asia/*' => Http::response([
+                'id' => 'chip_1',
+                'checkout_url' => 'https://gate.chip-in.asia/checkout/chip_1',
+            ], 200),
+        ]);
+
+        $manager = app(GatewayManager::class);
+        $payable = new TestEloquentPayable([
+            'reference' => 'pend-1',
+            'status' => PaymentStatus::defaultPendingStatus(),
+            'gateway' => 'chip',
+            'amount' => 1000,
+            'currency' => 'MYR',
+            'description' => 'Pending',
+        ]);
+
+        $this->assertTrue($manager->initiate('chip', $payable)->isRedirect());
+    }
+
+    public function test_the_reinitiation_guard_can_be_disabled(): void
+    {
+        config(['payment-gateway.guard_paid_initiation' => false]);
+
+        Http::fake([
+            'gate.chip-in.asia/*' => Http::response([
+                'id' => 'chip_1',
+                'checkout_url' => 'https://gate.chip-in.asia/checkout/chip_1',
+            ], 200),
+        ]);
+
+        $manager = app(GatewayManager::class);
+        $payable = new TestEloquentPayable([
+            'reference' => 'paid-2',
+            'status' => PaymentStatus::defaultSuccessStatus(),
+            'gateway' => 'chip',
+            'amount' => 1000,
+            'currency' => 'MYR',
+            'description' => 'Already paid but guard off',
+        ]);
+
+        $this->assertTrue($manager->initiate('chip', $payable)->isRedirect());
     }
 }

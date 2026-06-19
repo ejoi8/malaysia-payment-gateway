@@ -4,10 +4,15 @@ namespace Ejoi8\MalaysiaPaymentGateway;
 
 use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentInitiated;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentRefunded;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
+use Ejoi8\MalaysiaPaymentGateway\Exceptions\PaymentAlreadyProcessedException;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Illuminate\Database\Eloquent\Model;
 use InvalidArgumentException;
 
 /**
@@ -39,15 +44,28 @@ class GatewayManager
     }
 
     /**
+     * Alias for driver(): resolve a gateway instance by name.
+     *
+     * Reads naturally through the Payment facade, e.g.
+     * Payment::gateway('chip')->initiate($payable).
+     */
+    public function gateway(?string $name = null): GatewayInterface
+    {
+        return $this->driver($name);
+    }
+
+    /**
      * Initiate payment and fire event.
      */
-    public function initiate(string $driver, PayableInterface $payable): array
+    public function initiate(string $driver, PayableInterface $payable): PaymentResponse
     {
-        $gateway = $this->driver($driver);
+        $this->guardAgainstReinitiatingPaid($payable);
 
-        $response = $gateway->initiate($payable);
+        $response = $this->driver($driver)->initiate($payable);
 
-        event(new PaymentInitiated($payable, $driver, $response));
+        // The event carries a plain array so listeners (including queued ones)
+        // stay simple and serialization-safe.
+        event(new PaymentInitiated($payable, $driver, $response->toArray()));
 
         return $response;
     }
@@ -55,25 +73,14 @@ class GatewayManager
     /**
      * Verify payment and fire appropriate event.
      */
-    public function verify(string $driver, PayableInterface $payable, array $payload): array
+    public function verify(string $driver, PayableInterface $payable, array $payload): VerificationResult
     {
-        $gateway = $this->driver($driver);
-        $result = $gateway->verify($payable, $payload);
+        $result = $this->driver($driver)->verify($payable, $payload);
 
-        if ($result['success']) {
-            event(new PaymentSucceeded(
-                $payable,
-                $driver,
-                $result['transaction_id'] ?? '',
-                $result['meta'] ?? []
-            ));
+        if ($result->success) {
+            event(new PaymentSucceeded($payable, $driver, $result->transactionId ?? '', $result->meta));
         } else {
-            event(new PaymentFailed(
-                $payable,
-                $driver,
-                $result['error'] ?? 'Unknown error',
-                $result['meta'] ?? []
-            ));
+            event(new PaymentFailed($payable, $driver, $result->error ?? 'Unknown error', $result->meta));
         }
 
         return $result;
@@ -82,24 +89,44 @@ class GatewayManager
     /**
      * Process refund and fire event.
      */
-    public function refund(string $driver, string $transactionId, ?int $amount = null): array
+    public function refund(string $driver, string $transactionId, ?int $amount = null): VerificationResult
     {
         $gateway = $this->driver($driver);
 
         if (! $gateway->supportsRefunds()) {
-            return [
-                'success' => false,
-                'error' => "Gateway '{$driver}' does not support refunds",
-            ];
+            return VerificationResult::failure("Gateway '{$driver}' does not support refunds");
         }
 
         $result = $gateway->refund($transactionId, $amount);
 
-        if ($result['success']) {
-            event(new PaymentRefunded($transactionId, $driver, $amount, $result['meta'] ?? []));
+        if ($result->success) {
+            event(new PaymentRefunded($transactionId, $driver, $amount, $result->meta));
         }
 
         return $result;
+    }
+
+    /**
+     * Refuse to initiate a payment that has already succeeded, to avoid a
+     * second charge (double-clicked button, stale link). Failed/pending
+     * payments may be (re)initiated. Skipped for payables that don't expose a
+     * status, or when disabled via config.
+     */
+    protected function guardAgainstReinitiatingPaid(PayableInterface $payable): void
+    {
+        if (! config('payment-gateway.guard_paid_initiation', true)) {
+            return;
+        }
+
+        $status = $payable instanceof Model
+            ? $payable->getAttribute('status')
+            : ($payable->status ?? null);
+
+        if (is_string($status) && PaymentStatus::isSuccess($status)) {
+            throw new PaymentAlreadyProcessedException(
+                "Payment [{$payable->getPaymentReference()}] has already been paid (status: {$status})."
+            );
+        }
     }
 
     /**
@@ -155,5 +182,24 @@ class GatewayManager
     public function checkStatus(string $driver, PayableInterface $payable): array
     {
         return $this->driver($driver)->checkStatus($payable);
+    }
+
+    /**
+     * Poll the gateway for a payment's real status and, if it has resolved,
+     * fire the matching event (so a missed webhook is recovered). Returns the
+     * resolved status string.
+     */
+    public function reconcile(string $driver, PayableInterface $payable): string
+    {
+        $result = $this->driver($driver)->checkStatus($payable);
+        $status = $result['status'] ?? PaymentStatus::PENDING->value;
+
+        if (PaymentStatus::isSuccess($status)) {
+            event(new PaymentSucceeded($payable, $driver, $result['transaction_id'] ?? '', $result));
+        } elseif (PaymentStatus::isFailed($status)) {
+            event(new PaymentFailed($payable, $driver, $result['message'] ?? 'Payment failed', $result));
+        }
+
+        return $status;
     }
 }

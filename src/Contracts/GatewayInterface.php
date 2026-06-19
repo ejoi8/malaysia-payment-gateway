@@ -3,11 +3,16 @@
 namespace Ejoi8\MalaysiaPaymentGateway\Contracts;
 
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
 
 /**
  * Contract for payment gateway implementations.
  *
  * Each gateway (Chip, ToyyibPay, Stripe, etc.) implements this interface.
+ * Most gateways should extend {@see \Ejoi8\MalaysiaPaymentGateway\Gateways\AbstractGateway},
+ * which provides shared config resolution, response builders and sensible
+ * defaults for the optional capability methods below.
  */
 interface GatewayInterface
 {
@@ -30,29 +35,27 @@ interface GatewayInterface
      * Initiate a payment for the given payable entity.
      *
      * @param  PayableInterface  $payable  The entity being paid for
-     * @return array Response with normalized initiation data:
-     *               - 'type' (required)
-     *               - 'payload' (required)
-     *               - 'transaction_id' (required, nullable on errors)
-     *               - 'url' (for redirect-based gateways)
-     *               - 'response' (when a raw provider response exists)
-     *
-     *               Gateways may include legacy/provider-specific keys such as
-     *               'session_id', 'order_id', or top-level manual instruction fields
-     *               for backward compatibility.
+     * @return PaymentResponse Normalized initiation result. Exposes typed
+     *                         accessors (isRedirect(), redirectUrl(), ...) and,
+     *                         for backward compatibility, array access to the
+     *                         normalized keys ('type', 'payload', 'transaction_id',
+     *                         'url', 'response') plus any gateway-specific extras
+     *                         such as 'session_id', 'order_id' or manual
+     *                         instruction fields.
      */
-    public function initiate(PayableInterface $payable): array;
+    public function initiate(PayableInterface $payable): PaymentResponse;
 
     /**
      * Verify a payment callback/webhook.
      *
      * @param  PayableInterface  $payable  The entity that was paid for
      * @param  array  $payload  The callback/webhook data
-     * @return array Verification result:
-     *               - ['success' => true, 'transaction_id' => '...', 'meta' => [...]]
-     *               - ['success' => false, 'error' => '...']
+     * @return VerificationResult Verification result. Exposes typed properties
+     *                           ($result->success, $result->transactionId,
+     *                           $result->error, $result->meta) and array access
+     *                           for backward compatibility.
      */
-    public function verify(PayableInterface $payable, array $payload): array;
+    public function verify(PayableInterface $payable, array $payload): VerificationResult;
 
     /**
      * Check if gateway supports webhooks.
@@ -69,9 +72,9 @@ interface GatewayInterface
      *
      * @param  string  $transactionId  The original transaction ID
      * @param  int  $amount  Amount to refund in cents (null = full refund)
-     * @return array Refund result
+     * @return VerificationResult Refund result (success/error + meta).
      */
-    public function refund(string $transactionId, ?int $amount = null): array;
+    public function refund(string $transactionId, ?int $amount = null): VerificationResult;
 
     /**
      * Verify webhook signature (if applicable).
