@@ -2,33 +2,21 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Gateways;
 
-use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
-use Illuminate\Support\Facades\Http;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Ejoi8\MalaysiaPaymentGateway\Support\Signature;
+use Illuminate\Http\Request;
 
 /**
  * ToyyibPay payment gateway (Malaysian FPX provider).
  *
  * @see https://toyyibpay.com/apireference
  */
-class ToyyibPayGateway implements GatewayInterface
+class ToyyibPayGateway extends AbstractGateway
 {
-    public function __construct(
-        protected ?string $secretKey = null,
-        protected ?string $categoryCode = null,
-        protected bool $sandbox = false
-    ) {}
-
-    public static function make(array $config): self
-    {
-        return new self(
-            secretKey: $config['secret_key'] ?? null,
-            categoryCode: $config['category_code'] ?? null,
-            sandbox: $config['sandbox'] ?? false
-        );
-    }
-
     public function getName(): string
     {
         return 'toyyibpay';
@@ -39,139 +27,134 @@ class ToyyibPayGateway implements GatewayInterface
         return GatewayType::WEBHOOK;
     }
 
-    public function initiate(PayableInterface $payable): array
+    public function initiate(PayableInterface $payable): PaymentResponse
     {
         $payload = $this->buildPayload($payable);
 
-        // Make actual API call to ToyyibPay
-        $response = Http::asForm()->post($this->getApiUrl().'index.php/api/createBill', $payload);
+        $response = $this->http()->asForm()->post($this->getApiUrl().'index.php/api/createBill', $payload);
 
         if ($response->failed()) {
-            $responseData = $response->json() ?: ['body' => $response->body()];
-
-            return [
-                'type' => 'error',
-                'error' => 'ToyyibPay API Error: '.$response->body(),
-                'payload' => $payload,
-                'response' => $responseData,
-                'transaction_id' => null,
-            ];
+            return $this->fail(
+                'ToyyibPay API Error: '.$response->body(),
+                $payload,
+                $response->json() ?: ['body' => $response->body()],
+            );
         }
 
-        // ToyyibPay returns an array or string. Success is usually [{"BillCode":"..."}]
+        // ToyyibPay returns success as [{"BillCode":"..."}].
         $data = $response->json();
-
-        // Check if we got a valid code
         $billCode = $data[0]['BillCode'] ?? null;
 
         if (! $billCode) {
-            return [
-                'type' => 'error',
-                'error' => 'ToyyibPay did not return a BillCode: '.$response->body(),
-                'payload' => $payload,
-                'response' => $data ?: ['body' => $response->body()],
-                'transaction_id' => null,
-            ];
+            return $this->fail(
+                'ToyyibPay did not return a BillCode: '.$response->body(),
+                $payload,
+                $data ?: ['body' => $response->body()],
+            );
         }
 
-        return [
-            'type' => 'redirect',
-            'url' => $this->getCheckoutUrl($billCode),
-            'payload' => $payload,
-            'response' => $data,
-            'transaction_id' => $billCode,
-        ];
+        return $this->redirect($this->getCheckoutUrl($billCode), $billCode, $payload, $data);
     }
 
     /**
-     * Verify payment status from webhook callback.
+     * Verify a ToyyibPay callback/return.
      *
-     * This method is called by the PaymentWebhookController when a webhook
-     * is received from ToyyibPay. It examines the webhook payload to determine
-     * if the payment was successful.
-     *
-     * ToyyibPay webhook payload contains:
-     * - status_id: 1 = success, 2 = pending, 3 = failed
-     * - billcode: The bill reference
-     * - amount: Payment amount
-     *
-     * @param  PayableInterface  $payable  The payment record being verified
-     * @param  array  $payload  The raw webhook payload from ToyyibPay
-     * @return array Returns ['success' => bool, 'transaction_id' => string|null, 'meta' => array]
-     *               - If successful: triggers PaymentSucceeded event
-     *               - If failed: triggers PaymentFailed event
+     * ToyyibPay sends an integer status: 1 = success, 2 = pending, 3 = fail.
+     * The return URL uses 'status_id' while the callback uses 'status'.
      */
-    public function verify(PayableInterface $payable, array $payload): array
+    public function verify(PayableInterface $payable, array $payload): VerificationResult
     {
-        // ToyyibPay Callback URL sends (POST format):
-        // - refno: Payment reference no
-        // - status: Payment status (INTEGER: 1=success, 2=pending, 3=fail)
-        // - reason: Reason for the status received
-        // - billcode: Your billcode / permanent link
-        // - order_id: Your external payment reference no, if specified
-        // - amount: Payment amount received
-        // - transaction_time: Datetime of the transaction status received
-
-        // Note: Return URL sends status_id (GET format), but callback sends status (POST format)
-        $status = $payload['status'] ?? $payload['status_id'] ?? null;
-
-        // ToyyibPay sends status as INTEGER: 1 = success, 2 = pending, 3 = fail
-        // Convert to int for proper comparison
-        $status = (int) $status;
+        $status = (int) ($payload['status'] ?? $payload['status_id'] ?? 0);
 
         if ($status === 1) {
-            return [
-                'success' => true,
-                'transaction_id' => $payload['transaction_id'] ?? $payload['refno'] ?? $payload['billcode'] ?? null,
-                'meta' => $payload,
-            ];
+            return $this->verified(
+                $payload['transaction_id'] ?? $payload['refno'] ?? $payload['billcode'] ?? null,
+                $payload,
+            );
         }
 
-        return [
-            'success' => false,
-            'error' => $payload['reason'] ?? $payload['msg'] ?? 'Payment not successful',
-            'meta' => $payload,
-        ];
+        return $this->rejected($payload['reason'] ?? $payload['msg'] ?? 'Payment not successful', $payload);
     }
 
-    public function supportsWebhooks(): bool
+    /**
+     * Verify the authenticity of a ToyyibPay callback.
+     *
+     * The server-to-server callback POSTs a `hash` field equal to
+     * md5(userSecretKey + status + order_id + refno + "ok"). The browser return
+     * (GET) carries no hash, so there is nothing to verify there.
+     */
+    public function verifySignature(Request $request): bool
     {
-        return true;
+        $hash = $request->input('hash');
+
+        if (! $hash) {
+            // GET return / payloads without a hash — nothing to verify here.
+            return true;
+        }
+
+        $expected = Signature::hash(
+            (string) $this->setting('secret_key', '')
+                .$request->input('status')
+                .$request->input('order_id')
+                .$request->input('refno')
+                .'ok',
+            'md5',
+        );
+
+        return Signature::equals($expected, (string) $hash);
     }
 
-    public function supportsRefunds(): bool
+    public function getPaymentIdFromRequest(Request $request): ?string
     {
-        return false; // ToyyibPay doesn't support API refunds
+        // 'order_id' is our external reference; 'refno' is ToyyibPay's internal ID.
+        return $request->input('order_id') ?? $request->input('billcode') ?? $request->input('refno');
     }
 
-    public function refund(string $transactionId, ?int $amount = null): array
+    /**
+     * @return array<string, mixed>
+     */
+    public function checkStatus(PayableInterface $payable): array
     {
-        return [
-            'success' => false,
-            'error' => 'ToyyibPay does not support API refunds',
-        ];
+        $settings = $payable->getPaymentSettings();
+        $id = $this->transactionId($payable); // the bill code
+
+        if (! $id) {
+            return $this->statusResult(PaymentStatus::PENDING, 'No ToyyibPay bill code stored yet.');
+        }
+
+        $response = $this->http()->asForm()->post($this->getApiUrl().'index.php/api/getBillTransactions', [
+            'userSecretKey' => $this->setting('secret_key', '', $settings),
+            'billCode' => $id,
+        ]);
+
+        if ($response->failed()) {
+            return $this->statusResult(PaymentStatus::PENDING, 'Could not retrieve status from ToyyibPay.', $id);
+        }
+
+        // billpaymentStatus: 1 = success, 2 = pending, 3 = fail.
+        $payStatus = (string) ($response->json()[0]['billpaymentStatus'] ?? '');
+
+        return match ($payStatus) {
+            '1' => $this->statusResult(PaymentStatus::PAID, 'Payment confirmed by ToyyibPay.', $id),
+            '3' => $this->statusResult(PaymentStatus::FAILED, 'Payment failed.', $id),
+            default => $this->statusResult(PaymentStatus::PENDING, 'Payment still pending.', $id),
+        };
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     protected function buildPayload(PayableInterface $payable): array
     {
         $settings = $payable->getPaymentSettings();
         $customer = $payable->getPaymentCustomer();
         $urls = $payable->getPaymentUrls();
-        $items = $payable->getPaymentItems();
 
-        $maxItems = (int) ($settings['max_items']
-            ?? $settings['payment_item_max']
-            ?? config('payment-gateway.settings.max_items', 5));
-        $billName = $payable->getPaymentReference();
-
-        if (count($items) > $maxItems) {
-            $billName = 'Payment ('.count($items).' items)';
-        }
-
+        // ToyyibPay charges a single bill at billAmount; it has no line items.
         return [
-            'userSecretKey' => $this->setting($settings, 'secret_key', 'toyyibpay_secret_key', ''),
-            'categoryCode' => $this->setting($settings, 'category_code', 'toyyibpay_category_code', ''),
-            'billName' => $billName,
+            'userSecretKey' => $this->setting('secret_key', '', $settings),
+            'categoryCode' => $this->setting('category_code', '', $settings),
+            'billName' => $payable->getPaymentReference(),
             'billDescription' => $payable->getPaymentDescription(),
             'billPriceSetting' => 0,
             'billPayorInfo' => 1,
@@ -186,72 +169,30 @@ class ToyyibPayGateway implements GatewayInterface
             'billSplitPaymentArgs' => '',
             'billPaymentChannel' => '0',
             'billContentEmail' => 'Thank you for your payment.',
-            'billChargeToCustomer' => $this->setting($settings, 'charge_customer', 'toyyibpay_charge_customer', 1),
+            'billChargeToCustomer' => $this->setting('charge_customer', 1, $settings),
             'billExpiryDate' => null,
-            'billExpiryDays' => $this->setting($settings, 'expiry_days', 'toyyibpay_expiry_days', 3),
+            'billExpiryDays' => $this->setting('expiry_days', 3, $settings),
         ];
     }
 
     protected function getApiUrl(): string
     {
-        return $this->sandbox
+        return $this->isSandbox()
             ? 'https://dev.toyyibpay.com/'
             : 'https://toyyibpay.com/';
     }
 
     protected function getCheckoutUrl(string $billCode): string
     {
-        $baseUrl = $this->sandbox
+        $baseUrl = $this->isSandbox()
             ? 'https://dev.toyyibpay.com'
             : 'https://toyyibpay.com';
 
         return $baseUrl.'/'.$billCode;
     }
 
-    public function verifySignature(\Illuminate\Http\Request $request): bool
+    protected function isSandbox(): bool
     {
-        // ToyyibPay doesn't have a signature header. Verify by checking known data points.
-        return true;
-    }
-
-    public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
-    {
-        // ToyyibPay callback: 'order_id' contains our billExternalReferenceNo.
-        // ToyyibPay callback: 'refno' is their internal transaction ID.
-        return $request->input('order_id') ?? $request->input('billcode') ?? $request->input('refno');
-    }
-
-    public function checkStatus(PayableInterface $payable): array
-    {
-        // Mock implementation for now
-        return [
-            'status' => 'pending',
-            'message' => 'Status check implemented (Stub for ToyyibPay).',
-        ];
-    }
-
-    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
-    {
-        $config = config('payment-gateway.gateways.toyyibpay', []);
-
-        foreach ([$key, $legacyKey] as $candidate) {
-            if (! $candidate) {
-                continue;
-            }
-
-            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
-                return $settings[$candidate];
-            }
-
-            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
-                return $config[$candidate];
-            }
-        }
-
-        return match ($key) {
-            'secret_key' => $this->secretKey ?? $default,
-            'category_code' => $this->categoryCode ?? $default,
-            default => $default,
-        };
+        return (bool) $this->setting('sandbox', false);
     }
 }

@@ -2,10 +2,14 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Gateways;
 
-use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
-use Illuminate\Support\Facades\Http;
+use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Ejoi8\MalaysiaPaymentGateway\Support\LineItems;
+use Ejoi8\MalaysiaPaymentGateway\Support\Signature;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -15,21 +19,8 @@ use Illuminate\Support\Facades\Log;
  *
  * @see https://stripe.com/docs/api
  */
-class StripeGateway implements GatewayInterface
+class StripeGateway extends AbstractGateway
 {
-    public function __construct(
-        protected ?string $secretKey = null,
-        protected ?string $publicKey = null
-    ) {}
-
-    public static function make(array $config): self
-    {
-        return new self(
-            secretKey: $config['secret_key'] ?? null,
-            publicKey: $config['public_key'] ?? null
-        );
-    }
-
     public function getName(): string
     {
         return 'stripe';
@@ -40,203 +31,112 @@ class StripeGateway implements GatewayInterface
         return GatewayType::API;
     }
 
-    public function initiate(PayableInterface $payable): array
+    public function supportsRefunds(): bool
+    {
+        return true;
+    }
+
+    public function initiate(PayableInterface $payable): PaymentResponse
     {
         $settings = $payable->getPaymentSettings();
         $secretKey = $this->secretKey($settings);
-
         $payload = $this->buildCheckoutPayload($payable);
 
-        // Create Stripe Checkout Session
-        $response = Http::withBasicAuth($secretKey, '')
+        $response = $this->http()->withBasicAuth($secretKey, '')
             ->asForm()
             ->post($this->getApiUrl().'/checkout/sessions', $payload);
 
         if ($response->successful()) {
             $session = $response->json();
 
-            return [
-                'type' => 'redirect',
-                'url' => $session['url'],
-                'session_id' => $session['id'],
-                'payload' => $payload,
-                'response' => $session,
-                'transaction_id' => $session['id'] ?? null,
-            ];
+            return $this->redirect(
+                url: $session['url'],
+                transactionId: $session['id'] ?? null,
+                payload: $payload,
+                response: $session,
+                extra: ['session_id' => $session['id'] ?? null],
+            );
         }
 
         $responseData = $response->json() ?: ['body' => $response->body()];
 
-        return [
-            'type' => 'error',
-            'error' => $responseData['error']['message'] ?? 'Failed to create checkout session',
-            'payload' => $payload,
-            'response' => $responseData,
-            'transaction_id' => null,
-        ];
+        return $this->fail(
+            $responseData['error']['message'] ?? 'Failed to create checkout session',
+            $payload,
+            $responseData,
+        );
     }
 
     /**
-     * Verify payment status from webhook or return URL.
+     * Verify a payment from either a return URL (session_id) or a webhook event.
      *
-     * This method supports two verification modes:
-     *
-     * **Mode 1: Return URL (Recommended for simplicity)**
-     * When user returns from Stripe Checkout, they land on success_url with session_id.
-     * Pass ['session_id' => 'cs_xxx'] and this method will call Stripe API to verify.
-     *
-     * **Mode 2: Webhook (Recommended for reliability)**
-     * Configure webhook in Stripe Dashboard. Stripe will POST event data.
-     * Pass the webhook payload directly and this method will verify the event.
-     *
-     * Stripe webhook events handled:
-     * - checkout.session.completed: Checkout session was completed
-     * - payment_intent.succeeded: Payment intent succeeded
-     * - payment_intent.payment_failed: Payment failed
-     *
-     * @param  PayableInterface  $payable  The payment record being verified
-     * @param  array  $payload  Either ['session_id' => '...'] or webhook event payload
-     * @return array Returns ['success' => bool, 'transaction_id' => string|null, 'meta' => array]
-     *               - If successful: triggers PaymentSucceeded event
-     *               - If failed: triggers PaymentFailed event
+     * - Return URL: pass ['session_id' => 'cs_xxx'] and Stripe is queried by API.
+     * - Webhook: pass the event payload (with a 'type' field).
      */
-    public function verify(PayableInterface $payable, array $payload): array
+    public function verify(PayableInterface $payable, array $payload): VerificationResult
     {
-        // Mode 1: Return URL verification (session_id provided)
-        // User returned from Stripe Checkout with session_id in query string
         if (isset($payload['session_id']) && ! isset($payload['type'])) {
             return $this->verifyBySessionId($payable, $payload['session_id']);
         }
 
-        // Mode 2: Webhook verification (event type provided)
         return $this->verifyWebhookEvent($payload);
     }
 
-    /**
-     * Verify payment by retrieving session from Stripe API.
-     *
-     * This is used when user returns via success_url with session_id.
-     * We call Stripe API to get the actual payment status.
-     *
-     * @param  PayableInterface  $payable  The payment record
-     * @param  string  $sessionId  The Stripe checkout session ID
-     * @return array Verification result
-     */
-    protected function verifyBySessionId(PayableInterface $payable, string $sessionId): array
+    protected function verifyBySessionId(PayableInterface $payable, string $sessionId): VerificationResult
     {
-        $settings = $payable->getPaymentSettings();
-        $secretKey = $this->secretKey($settings);
+        $secretKey = $this->secretKey($payable->getPaymentSettings());
 
-        // Call Stripe API to retrieve session details
-        $response = Http::withBasicAuth($secretKey, '')
+        $response = $this->http()->withBasicAuth($secretKey, '')
             ->get($this->getApiUrl().'/checkout/sessions/'.$sessionId);
 
         if ($response->failed()) {
-            return [
-                'success' => false,
-                'error' => 'Failed to retrieve session from Stripe: '.$response->body(),
-                'meta' => ['session_id' => $sessionId],
-            ];
+            return $this->rejected(
+                'Failed to retrieve session from Stripe: '.$response->body(),
+                ['session_id' => $sessionId],
+            );
         }
 
         $session = $response->json();
         $paymentStatus = $session['payment_status'] ?? null;
 
-        // Stripe session payment_status: 'paid', 'unpaid', or 'no_payment_required'
         if ($paymentStatus === 'paid' || $paymentStatus === 'no_payment_required') {
-            return [
-                'success' => true,
-                'transaction_id' => $session['payment_intent'] ?? $session['id'] ?? null,
-                'meta' => $session,
-            ];
+            return $this->verified($session['payment_intent'] ?? $session['id'] ?? null, $session);
         }
 
-        // Payment not completed
-        return [
-            'success' => false,
-            'error' => 'Payment not completed - status: '.($paymentStatus ?? 'unknown'),
-            'meta' => $session,
-        ];
+        return $this->rejected('Payment not completed - status: '.($paymentStatus ?? 'unknown'), $session);
     }
 
-    /**
-     * Verify payment from webhook event payload.
-     *
-     * This is used when Stripe sends webhook events.
-     *
-     * @param  array  $payload  The webhook event payload
-     * @return array Verification result
-     */
-    protected function verifyWebhookEvent(array $payload): array
+    protected function verifyWebhookEvent(array $payload): VerificationResult
     {
         $eventType = $payload['type'] ?? null;
 
-        // Handle checkout.session.completed event
         if ($eventType === 'checkout.session.completed') {
             $session = $payload['data']['object'] ?? [];
             $paymentStatus = $session['payment_status'] ?? null;
 
-            // Stripe sends payment_status: 'paid' for successful payments
-            // 'unpaid' means async payment method (e.g., bank transfer) - payment pending
-            // 'no_payment_required' means amount was 0 or fully covered by credits
             if ($paymentStatus === 'paid' || $paymentStatus === 'no_payment_required') {
-                return [
-                    'success' => true,
-                    'transaction_id' => $session['payment_intent'] ?? $session['id'] ?? null,
-                    'meta' => $payload,
-                ];
+                return $this->verified($session['payment_intent'] ?? $session['id'] ?? null, $payload);
             }
 
-            // Payment not yet completed (async payment methods)
-            return [
-                'success' => false,
-                'error' => 'Payment pending - status: '.($paymentStatus ?? 'unknown'),
-                'meta' => $payload,
-            ];
+            return $this->rejected('Payment pending - status: '.($paymentStatus ?? 'unknown'), $payload);
         }
 
-        // Handle payment_intent.succeeded event (alternative webhook)
         if ($eventType === 'payment_intent.succeeded') {
             $intent = $payload['data']['object'] ?? [];
 
-            return [
-                'success' => true,
-                'transaction_id' => $intent['id'] ?? null,
-                'meta' => $payload,
-            ];
+            return $this->verified($intent['id'] ?? null, $payload);
         }
 
-        // Handle payment_intent.payment_failed event
         if ($eventType === 'payment_intent.payment_failed') {
             $intent = $payload['data']['object'] ?? [];
-            $error = $intent['last_payment_error']['message'] ?? 'Payment failed';
 
-            return [
-                'success' => false,
-                'error' => $error,
-                'meta' => $payload,
-            ];
+            return $this->rejected($intent['last_payment_error']['message'] ?? 'Payment failed', $payload);
         }
 
-        // Unknown or unhandled event type
-        return [
-            'success' => false,
-            'error' => 'Unhandled event type: '.($eventType ?? 'unknown'),
-            'meta' => $payload,
-        ];
+        return $this->rejected('Unhandled event type: '.($eventType ?? 'unknown'), $payload);
     }
 
-    public function supportsWebhooks(): bool
-    {
-        return true;
-    }
-
-    public function supportsRefunds(): bool
-    {
-        return true;
-    }
-
-    public function refund(string $transactionId, ?int $amount = null): array
+    public function refund(string $transactionId, ?int $amount = null): VerificationResult
     {
         $secretKey = $this->secretKey();
 
@@ -245,51 +145,44 @@ class StripeGateway implements GatewayInterface
             $payload['amount'] = $amount;
         }
 
-        $response = Http::withBasicAuth($secretKey, '')
+        $response = $this->http()->withBasicAuth($secretKey, '')
             ->asForm()
             ->post($this->getApiUrl().'/refunds', $payload);
 
         if ($response->successful()) {
-            return [
-                'success' => true,
-                'refund_id' => $response->json()['id'],
-                'meta' => $response->json(),
-            ];
+            $data = $response->json();
+
+            return $this->verified($data['id'] ?? null, $data);
         }
 
-        return [
-            'success' => false,
-            'error' => $response->json()['error']['message'] ?? 'Refund failed',
-        ];
+        return $this->rejected($response->json()['error']['message'] ?? 'Refund failed');
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     protected function buildCheckoutPayload(PayableInterface $payable): array
     {
         $customer = $payable->getPaymentCustomer();
         $urls = $payable->getPaymentUrls();
-        $items = $payable->getPaymentItems();
         $reference = $payable->getPaymentReference();
 
-        $lineItems = array_map(fn ($item, $i) => [
-            "line_items[$i][price_data][currency]" => strtolower($payable->getPaymentCurrency()),
-            "line_items[$i][price_data][product_data][name]" => $item['name'],
-            "line_items[$i][price_data][unit_amount]" => $item['price'],
-            "line_items[$i][quantity]" => $item['quantity'] ?? 1,
-        ], $items, array_keys($items));
-
-        $payload = array_merge(...$lineItems);
-
-        return array_merge($payload, [
+        // Single line at the authoritative total — Stripe charges exactly this,
+        // never a recomputed sum of itemised lines.
+        return [
+            'line_items[0][price_data][currency]' => strtolower($payable->getPaymentCurrency()),
+            'line_items[0][price_data][product_data][name]' => LineItems::summaryName($payable),
+            'line_items[0][price_data][unit_amount]' => $payable->getPaymentAmount(),
+            'line_items[0][quantity]' => 1,
             'mode' => 'payment',
             'success_url' => ($urls['return_url'] ?? '').'?session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $urls['cancel_url'] ?? $urls['return_url'] ?? '',
             'client_reference_id' => $reference,
             'customer_email' => $customer['email'] ?? null,
-            // Attach reference to metadata so PaymentIntent events can also identify the order
-            // Use bracket notation for form-encoded API
+            // Attach reference to metadata so PaymentIntent events can also identify the order.
             'metadata[reference]' => $reference,
             'payment_intent_data[metadata][reference]' => $reference,
-        ]);
+        ];
     }
 
     protected function getApiUrl(): string
@@ -297,11 +190,11 @@ class StripeGateway implements GatewayInterface
         return 'https://api.stripe.com/v1';
     }
 
-    public function verifySignature(\Illuminate\Http\Request $request): bool
+    public function verifySignature(Request $request): bool
     {
         $webhookSecret = $this->webhookSecret();
 
-        // Skip verification if no secret configured (development only)
+        // Skip verification if no secret configured (development only).
         if (empty($webhookSecret)) {
             Log::warning('Stripe webhook signature verification skipped - no secret configured');
 
@@ -318,8 +211,7 @@ class StripeGateway implements GatewayInterface
         $payload = $request->getContent();
 
         try {
-            // Parse signature header
-            // Format: t=timestamp,v1=signature1,v1=signature2
+            // Parse signature header. Format: t=timestamp,v1=signature1,v1=signature2
             $elements = explode(',', $signature);
             $timestamp = null;
             $signatures = [];
@@ -341,21 +233,17 @@ class StripeGateway implements GatewayInterface
                 return false;
             }
 
-            // Verify timestamp is recent (within 5 minutes)
-            $currentTime = time();
-            if (abs($currentTime - $timestamp) > 300) {
+            // Verify timestamp is recent (within 5 minutes).
+            if (abs(time() - (int) $timestamp) > 300) {
                 Log::error('Stripe webhook: Timestamp too old or too far in future');
 
                 return false;
             }
 
-            // Construct signed payload
-            $signedPayload = "{$timestamp}.{$payload}";
-            $expectedSignature = hash_hmac('sha256', $signedPayload, $webhookSecret);
+            $expectedSignature = Signature::hmac("{$timestamp}.{$payload}", $webhookSecret);
 
-            // Compare signatures (constant-time comparison)
             foreach ($signatures as $sig) {
-                if (hash_equals($expectedSignature, $sig)) {
+                if (Signature::equals($expectedSignature, $sig)) {
                     return true;
                 }
             }
@@ -363,7 +251,6 @@ class StripeGateway implements GatewayInterface
             Log::error('Stripe webhook: Signature verification failed');
 
             return false;
-
         } catch (\Exception $e) {
             Log::error('Stripe webhook signature verification error: '.$e->getMessage());
 
@@ -371,76 +258,66 @@ class StripeGateway implements GatewayInterface
         }
     }
 
-    public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
+    public function getPaymentIdFromRequest(Request $request): ?string
     {
-        // Mode 1: Return URL callback (session_id in query string)
+        // Mode 1: Return URL callback (session_id in query string).
         if ($request->has('session_id') && ! $request->has('type')) {
-            $secretKey = $this->secretKey();
-
-            $response = Http::withBasicAuth($secretKey, '')
+            $response = $this->http()->withBasicAuth($this->secretKey(), '')
                 ->get($this->getApiUrl().'/checkout/sessions/'.$request->input('session_id'));
 
             if ($response->successful()) {
                 $data = $response->json();
 
-                return $data['client_reference_id']
-                    ?? $data['metadata']['reference']
-                    ?? null;
+                return $data['client_reference_id'] ?? $data['metadata']['reference'] ?? null;
             }
 
             return null;
         }
 
-        // Mode 2: Webhook callback
-        // Try getting from client_reference_id (Checkout Session)
-        $reference = $request->input('data.object.client_reference_id');
-
-        // Check for metadata.reference (fallback for PaymentIntent or if client_ref missing)
-        if (! $reference) {
-            $reference = $request->input('data.object.metadata.reference');
-        }
-
-        return $reference;
+        // Mode 2: Webhook callback (Checkout Session, falling back to PaymentIntent metadata).
+        return $request->input('data.object.client_reference_id')
+            ?? $request->input('data.object.metadata.reference');
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     public function checkStatus(PayableInterface $payable): array
     {
-        // Mock implementation for now
-        // To implement real check: GET /checkout/sessions with client_reference_id query if possible, or store Session ID.
-        return [
-            'status' => 'pending',
-            'message' => 'Status check implemented (Stub for Stripe).',
-        ];
+        $id = $this->transactionId($payable); // the checkout session id
+
+        if (! $id) {
+            return $this->statusResult(PaymentStatus::PENDING, 'No Stripe session id stored yet.');
+        }
+
+        $response = $this->http()->withBasicAuth($this->secretKey($payable->getPaymentSettings()), '')
+            ->get($this->getApiUrl().'/checkout/sessions/'.$id);
+
+        if ($response->failed()) {
+            return $this->statusResult(PaymentStatus::PENDING, 'Could not retrieve status from Stripe.', $id);
+        }
+
+        $session = $response->json();
+        $paymentStatus = $session['payment_status'] ?? null;
+
+        if (in_array($paymentStatus, ['paid', 'no_payment_required'], true)) {
+            return $this->statusResult(PaymentStatus::PAID, 'Payment confirmed by Stripe.', $session['payment_intent'] ?? $id);
+        }
+
+        if (($session['status'] ?? null) === 'expired') {
+            return $this->statusResult(PaymentStatus::FAILED, 'Checkout session expired.', $id);
+        }
+
+        return $this->statusResult(PaymentStatus::PENDING, 'Payment still pending.', $id);
     }
 
     protected function secretKey(array $settings = []): string
     {
-        return (string) $this->setting($settings, 'secret_key', 'stripe_secret_key', $this->secretKey ?? '');
+        return (string) $this->setting('secret_key', '', $settings);
     }
 
     protected function webhookSecret(): string
     {
-        return (string) $this->setting([], 'webhook_secret', 'stripe_webhook_secret', '');
-    }
-
-    protected function setting(array $settings, string $key, ?string $legacyKey = null, mixed $default = null): mixed
-    {
-        $config = config('payment-gateway.gateways.stripe', []);
-
-        foreach ([$key, $legacyKey] as $candidate) {
-            if (! $candidate) {
-                continue;
-            }
-
-            if (array_key_exists($candidate, $settings) && $settings[$candidate] !== null && $settings[$candidate] !== '') {
-                return $settings[$candidate];
-            }
-
-            if (array_key_exists($candidate, $config) && $config[$candidate] !== null && $config[$candidate] !== '') {
-                return $config[$candidate];
-            }
-        }
-
-        return $default;
+        return (string) $this->setting('webhook_secret', '');
     }
 }

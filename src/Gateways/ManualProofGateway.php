@@ -2,29 +2,20 @@
 
 namespace Ejoi8\MalaysiaPaymentGateway\Gateways;
 
-use Ejoi8\MalaysiaPaymentGateway\Contracts\GatewayInterface;
 use Ejoi8\MalaysiaPaymentGateway\Contracts\PayableInterface;
 use Ejoi8\MalaysiaPaymentGateway\Enums\GatewayType;
 use Ejoi8\MalaysiaPaymentGateway\Enums\PaymentStatus;
+use Ejoi8\MalaysiaPaymentGateway\Responses\PaymentResponse;
+use Ejoi8\MalaysiaPaymentGateway\Responses\VerificationResult;
+use Illuminate\Http\Request;
 
 /**
  * Manual proof gateway (bank transfer with receipt upload).
+ *
+ * No automated verification — an administrator approves or rejects the proof.
  */
-class ManualProofGateway implements GatewayInterface
+class ManualProofGateway extends AbstractGateway
 {
-    public function __construct(
-        protected ?string $message = null,
-        protected ?string $bankInfo = null
-    ) {}
-
-    public static function make(array $config): self
-    {
-        return new self(
-            message: $config['message'] ?? null,
-            bankInfo: $config['bank_info'] ?? null
-        );
-    }
-
     public function getName(): string
     {
         return 'manual_proof';
@@ -35,92 +26,61 @@ class ManualProofGateway implements GatewayInterface
         return GatewayType::MANUAL;
     }
 
-    public function initiate(PayableInterface $payable): array
+    public function supportsWebhooks(): bool
+    {
+        return false;
+    }
+
+    public function initiate(PayableInterface $payable): PaymentResponse
     {
         $settings = $payable->getPaymentSettings();
-        $payload = [
+
+        $fields = [
             'message' => $settings['message']
                 ?? $settings['manual_proof_message']
-                ?? $this->message
-                ?? config('payment-gateway.gateways.manual_proof.message')
+                ?? $this->setting('message')
                 ?? 'Please make a bank transfer and upload your payment receipt.',
             'bank_info' => $settings['bank_info']
                 ?? $settings['bank_account_info']
-                ?? $this->bankInfo
-                ?? config('payment-gateway.gateways.manual_proof.bank_info')
+                ?? $this->setting('bank_info')
                 ?? 'Contact administrator for bank details.',
             'reference' => $payable->getPaymentReference(),
             'amount' => $payable->getPaymentAmount(),
             'currency' => $payable->getPaymentCurrency(),
         ];
 
-        return [
-            'type' => 'instructions',
-            'message' => $payload['message'],
-            'bank_info' => $payload['bank_info'],
-            'reference' => $payload['reference'],
-            'amount' => $payload['amount'],
-            'currency' => $payload['currency'],
-            'payload' => $payload,
-            'transaction_id' => 'manual-'.$payable->getPaymentReference(),
-        ];
+        return $this->instructions($fields, 'manual-'.$payable->getPaymentReference(), $fields);
     }
 
-    public function verify(PayableInterface $payable, array $payload): array
+    public function verify(PayableInterface $payable, array $payload): VerificationResult
     {
-        // Manual verification - approval is handled by admin
-        $approved = $payload['approved'] ?? false;
-
-        if ($approved) {
-            return [
-                'success' => true,
-                'transaction_id' => 'manual-' . $payable->getPaymentReference(),
-                'meta' => array_merge($payload, [
-                    'verified_at' => now()->toDateTimeString(),
-                ]),
-            ];
+        // Manual verification — approval is performed by an admin.
+        if ($payload['approved'] ?? false) {
+            return $this->verified(
+                'manual-'.$payable->getPaymentReference(),
+                array_merge($payload, ['verified_at' => now()->toDateTimeString()]),
+            );
         }
 
-        return [
-            'success' => false,
-            'error' => $payload['rejection_reason'] ?? 'Payment proof rejected',
-            'meta' => $payload,
-        ];
+        return $this->rejected($payload['rejection_reason'] ?? 'Payment proof rejected', $payload);
     }
 
-    public function supportsWebhooks(): bool
+    public function refund(string $transactionId, ?int $amount = null): VerificationResult
     {
-        return false;
+        return $this->rejected('Manual proof payments must be refunded manually');
     }
 
-    public function supportsRefunds(): bool
+    public function getPaymentIdFromRequest(Request $request): ?string
     {
-        return false;
-    }
-
-    public function refund(string $transactionId, ?int $amount = null): array
-    {
-        return [
-            'success' => false,
-            'error' => 'Manual proof payments must be refunded manually',
-        ];
-    }
-
-    public function verifySignature(\Illuminate\Http\Request $request): bool
-    {
-        // Manual proof doesn't have webhooks, so signature is always valid
-        return true;
-    }
-
-    public function getPaymentIdFromRequest(\Illuminate\Http\Request $request): ?string
-    {
-        // Manual proof uses reference from request
         return $request->input('reference');
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     public function checkStatus(PayableInterface $payable): array
     {
-        // Manual proof status is managed internally, not via external API
+        // Status is managed internally, not via an external API.
         return [
             'status' => PaymentStatus::PENDING_VERIFICATION->value,
             'message' => 'Awaiting manual verification by administrator.',

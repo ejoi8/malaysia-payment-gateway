@@ -76,20 +76,20 @@ class Payment extends Model implements PayableInterface
      */
     public function getPaymentUrls(): array
     {
-        // Allow overrides from metadata if provided
-        if (! empty($this->metadata['urls'])) {
-            return $this->metadata['urls'];
-        }
-
-        // Use unified webhook route for both return URL and callback
-        // This ensures both GET (user return) and POST (webhook) work
+        // Use unified webhook route for both return URL and callback so that
+        // both GET (user return) and POST (webhook) hit the same endpoint.
         $webhookUrl = route('payment-gateway.webhook', ['driver' => $this->gateway ?? 'chip']);
 
-        return [
+        $defaults = [
             'return_url' => $webhookUrl,   // User return (GET) - Stripe session_id, PayPal token
             'callback_url' => $webhookUrl, // Gateway webhook (POST) - CHIP, ToyyibPay, Stripe webhook
             'cancel_url' => route('payment-gateway.status.portal'),
         ];
+
+        // Per-payment overrides (e.g. success_redirect / failed_redirect) are
+        // merged over the defaults rather than replacing them, so the gateway
+        // return/callback URLs are never accidentally dropped.
+        return array_merge($defaults, $this->metadata['urls'] ?? []);
     }
 
     /**
@@ -114,5 +114,17 @@ class Payment extends Model implements PayableInterface
     public static function findByReference(string $reference): ?self
     {
         return static::where('reference', $reference)->first();
+    }
+
+    /**
+     * Find by the gateway transaction id.
+     *
+     * Optional hook used to resolve a payable when only the transaction id is
+     * known (e.g. when persisting a refund). Implement this on a custom payable
+     * model to enable automatic refund-status updates.
+     */
+    public static function findByTransactionId(string $transactionId): ?self
+    {
+        return static::where('transaction_id', $transactionId)->first();
     }
 }

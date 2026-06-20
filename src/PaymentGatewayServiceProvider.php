@@ -4,7 +4,11 @@ namespace Ejoi8\MalaysiaPaymentGateway;
 
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentFailed;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentInitiated;
+use Ejoi8\MalaysiaPaymentGateway\Events\PaymentRefunded;
+use Ejoi8\MalaysiaPaymentGateway\Console\Commands\ReconcilePaymentsCommand;
 use Ejoi8\MalaysiaPaymentGateway\Events\PaymentSucceeded;
+use Ejoi8\MalaysiaPaymentGateway\Listeners\DispatchPaymentWebhook;
+use Ejoi8\MalaysiaPaymentGateway\Listeners\PersistInitiationId;
 use Ejoi8\MalaysiaPaymentGateway\Listeners\SendPaymentNotification;
 use Ejoi8\MalaysiaPaymentGateway\Listeners\UpdatePaymentStatus;
 use Ejoi8\MalaysiaPaymentGateway\Support\GatewayFactory;
@@ -51,6 +55,7 @@ class PaymentGatewayServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
             $this->registerPublishes();
+            $this->commands([ReconcilePaymentsCommand::class]);
         }
 
         $this->loadRoutesFrom(__DIR__.'/../routes/web.php');
@@ -99,8 +104,14 @@ class PaymentGatewayServiceProvider extends ServiceProvider
             $this->app['events']->listen($event, SendPaymentNotification::class);
         }
 
-        foreach ([PaymentSucceeded::class, PaymentFailed::class] as $event) {
+        $this->app['events']->listen(PaymentInitiated::class, PersistInitiationId::class);
+
+        foreach ([PaymentSucceeded::class, PaymentFailed::class, PaymentRefunded::class] as $event) {
             $this->app['events']->listen($event, UpdatePaymentStatus::class);
+        }
+
+        foreach ([PaymentSucceeded::class, PaymentFailed::class, PaymentRefunded::class] as $event) {
+            $this->app['events']->listen($event, DispatchPaymentWebhook::class);
         }
     }
 
